@@ -1,4 +1,6 @@
 # User config files (contain personal data)
 git-redact.conf.toml
 git-scrub-info.conf.toml
-git-scrub-info.conf.yaml
+
+# Generated reports
+reports/

@@ -17,14 +17,87 @@ Exit codes:
 """
 
 import argparse
+import math
 import os
 import re
 import subprocess
 import sys
-import tomllib
+from collections import Counter
 from pathlib import Path
 
+import tomllib
+
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# ── Entropy detection ──────────────────────────────────────────────────────────
+
+# Minimum length of a string to consider for entropy analysis.
+# Short strings have low entropy by nature and produce too many false positives.
+ENTROPY_MIN_LENGTH = 20
+
+# Shannon entropy threshold (bits per character). Values above this are likely
+# secrets/tokens. Base64-encoded data averages ~6 bits/char, hex ~4 bits/char.
+# Real English text averages ~4.7 bits/char but over longer strings, so we set
+# the threshold at 4.5 for strings of 20+ chars to catch most secrets while
+# avoiding common prose.
+ENTROPY_THRESHOLD = 4.5
+
+# Regex to extract candidate strings from diff lines. Matches long runs of
+# characters that look like keys, tokens, or encoded data.
+CANDIDATE_RE = re.compile(r"[A-Za-z0-9+/=_\-.]{20,}")
+
+# Known patterns that are high-entropy but not secrets (reducing false positives).
+ENTROPY_ALLOWLIST_RE = re.compile(
+    r"^(?:[A-Za-z0-9+/=_\-.]*\.){2,}[A-Za-z]{2,}$"  # domain names
+    r"|^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"  # IP addresses
+    r"|^[\w.\-]+@[\w.\-]+\.\w+$"  # email addresses
+    r"|^[A-Fa-f0-9]{40}$"  # SHA-1 hashes (commit hashes)
+    r"|^https?://",  # URLs
+    re.IGNORECASE,
+)
+
+
+def shannon_entropy(s):
+    """Calculate Shannon entropy of a string in bits per character."""
+    if len(s) <= 1:
+        return 0.0
+    counts = Counter(s)
+    length = len(s)
+    return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
+
+def extract_high_entropy_strings(diff_lines):
+    """Find high-entropy strings in diff output that aren't caught by patterns."""
+    findings = {}  # string -> count, for deduplication
+
+    for line in diff_lines:
+        # Only look at added lines
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+
+        # Strip the leading '+'
+        content = line[1:]
+
+        for match in CANDIDATE_RE.finditer(content):
+            candidate = match.group()
+
+            # Skip known non-secret patterns
+            if ENTROPY_ALLOWLIST_RE.match(candidate):
+                continue
+
+            # Skip if too short
+            if len(candidate) < ENTROPY_MIN_LENGTH:
+                continue
+
+            # Calculate entropy
+            entropy = shannon_entropy(candidate)
+            if entropy >= ENTROPY_THRESHOLD:
+                findings[candidate] = findings.get(candidate, 0) + 1
+
+    return findings
+
+
+# ── Config and CLI ────────────────────────────────────────────────────────────
 
 
 def parse_args():
@@ -32,12 +105,30 @@ def parse_args():
         prog="git-redact",
         description="Audit git repositories for personal data.",
     )
-    parser.add_argument("repo", nargs="?", default=os.getcwd(),
-                        help="Path to the git repo (default: current directory)")
-    parser.add_argument("-c", "--config", default=None,
-                        help="Path to config file")
-    parser.add_argument("-n", "--dry-run", action="store_true",
-                        help="Show what would be replaced/removed without doing it")
+    parser.add_argument(
+        "repo",
+        nargs="?",
+        default=os.getcwd(),
+        help="Path to the git repo (default: current directory)",
+    )
+    parser.add_argument("-c", "--config", default=None, help="Path to config file")
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="Show what would be replaced/removed without doing it",
+    )
+    parser.add_argument(
+        "--no-entropy",
+        action="store_true",
+        help="Disable entropy-based secret detection",
+    )
+    parser.add_argument(
+        "-r",
+        "--report",
+        action="store_true",
+        help="Write a timestamped report to reports/",
+    )
     return parser.parse_args()
 
 
@@ -50,7 +141,6 @@ def find_config(args_config, repo_path):
             sys.exit(2)
         return config
 
-    # Search in order: env var, repo root, script dir
     env_config = os.environ.get("GIT_REDACT_CONFIG")
     if env_config:
         config = Path(env_config)
@@ -66,10 +156,14 @@ def find_config(args_config, repo_path):
         if candidate.is_file():
             return candidate
 
-    print("ERROR: Config file not found. Set GIT_REDACT_CONFIG, pass --config, or",
-          file=sys.stderr)
-    print("       place git-redact.conf.toml in the repo root or next to the script.",
-          file=sys.stderr)
+    print(
+        "ERROR: Config file not found. Set GIT_REDACT_CONFIG, pass --config, or",
+        file=sys.stderr,
+    )
+    print(
+        "       place git-redact.conf.toml in the repo root or next to the script.",
+        file=sys.stderr,
+    )
     sys.exit(2)
 
 
@@ -78,7 +172,6 @@ def load_config(config_path):
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
 
-    # Validate required sections exist (can be empty)
     for section in ("paths", "patterns"):
         if section not in config:
             config[section] = []
@@ -88,18 +181,56 @@ def load_config(config_path):
     return config
 
 
+# ── Git helpers ────────────────────────────────────────────────────────────────
+
+
 def git_cmd(repo_path, *args):
     """Run a git command and return stdout."""
     result = subprocess.run(
         ["git", "-C", str(repo_path)] + list(args),
-        capture_output=True, text=True, errors="replace",
+        capture_output=True,
+        text=True,
+        errors="replace",
     )
     return result.stdout
 
 
+def get_diff_lines(repo_path):
+    """Fetch full diff output from all commits, split into lines.
+
+    Returns only added lines (prefixed with +) for diff-aware analysis,
+    but also returns all lines for pattern matching on context.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "log", "--all", "-p"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        errors="replace",
+    )
+    return result.stdout.splitlines()
+
+
+def get_added_lines(diff_lines):
+    """Extract only lines that were added (start with +, not +++)."""
+    return [
+        line
+        for line in diff_lines
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+
+
+# ── Checks ─────────────────────────────────────────────────────────────────────
+
+
 def action_label(action):
     """Return display label for an action."""
-    return {"report": "FAIL", "warn": "WARN", "replace": "REPLACE", "remove": "REMOVE"}.get(action, action.upper())
+    return {
+        "report": "FAIL",
+        "warn": "WARN",
+        "replace": "REPLACE",
+        "remove": "REMOVE",
+    }.get(action, action.upper())
 
 
 def check_paths(repo_path, entries):
@@ -110,39 +241,49 @@ def check_paths(repo_path, entries):
         pattern = entry["pattern"]
         action = entry.get("action", "report")
 
-        output = git_cmd(repo_path, "log", "--all", "--name-only", "--pretty=format:", "--", pattern)
-        files = [f for f in output.splitlines() if f.strip()]
-        count = len(set(files))  # unique files
+        output = git_cmd(
+            repo_path, "log", "--all", "--name-only", "--pretty=format:", "--", pattern
+        )
+        files = sorted(set(f for f in output.splitlines() if f.strip()))
+        count = len(files)
 
         if count > 0:
             print()
-            print(f"=== {label} ({count} unique file entries) [{action_label(action)}] ===")
-            for f in sorted(set(files))[:30]:
+            print(
+                f"=== {label} ({count} unique file entries) [{action_label(action)}] ==="
+            )
+            for f in files[:30]:
                 print(f)
             findings.append({"label": label, "action": action, "count": count})
 
     return findings
 
 
-def check_patterns(repo_path, entries):
-    """Check for text patterns in git history."""
+def check_patterns(repo_path, entries, diff_lines=None):
+    """Check for text patterns in git diff output (diff-aware)."""
+    if diff_lines is None:
+        diff_lines = get_diff_lines(repo_path)
+
+    # Only search added lines for pattern matches
+    added = get_added_lines(diff_lines)
+
     findings = []
     for entry in entries:
         label = entry.get("label", entry["pattern"])
         pattern = entry["pattern"]
         action = entry.get("action", "report")
 
-        # Use grep -E for extended regex support
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "log", "--all", "-p"],
-            capture_output=True, text=True, errors="replace",
-        )
-        matches = []
-        for line in result.stdout.splitlines():
-            if re.search(pattern, line):
-                matches.append(line)
+        # Compile with case-insensitive flag if pattern starts with (?i)
+        flags = 0
+        search_pattern = pattern
+        if search_pattern.startswith("(?i)"):
+            flags = re.IGNORECASE
+            search_pattern = search_pattern[4:]
 
+        regex = re.compile(search_pattern, flags)
+        matches = [line for line in added if regex.search(line)]
         count = len(matches)
+
         if count > 0:
             print()
             print(f"=== {label} ({count} matches) [{action_label(action)}] ===")
@@ -153,33 +294,26 @@ def check_patterns(repo_path, entries):
     return findings
 
 
-def check_patterns_fast(repo_path, entries):
-    """Check for text patterns in git history using grep for speed."""
-    findings = []
-    for entry in entries:
-        label = entry.get("label", entry["pattern"])
-        pattern = entry["pattern"]
-        action = entry.get("action", "report")
+def check_entropy(repo_path, diff_lines):
+    """Detect high-entropy strings that may be secrets/tokens."""
+    added = get_added_lines(diff_lines)
+    findings = {}
 
-        # Count matches
-        count_result = subprocess.run(
-            ["git", "-C", str(repo_path), "log", "--all", "-p"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
-        )
-        count = 0
-        matching_lines = []
-        for line in count_result.stdout.splitlines():
-            if re.search(pattern, line):
-                count += 1
-                if len(matching_lines) < 20:
-                    matching_lines.append(line)
+    for line in added:
+        content = line[1:]  # strip leading +
+        for match in CANDIDATE_RE.finditer(content):
+            candidate = match.group()
 
-        if count > 0:
-            print()
-            print(f"=== {label} ({count} matches) [{action_label(action)}] ===")
-            for m in matching_lines:
-                print(m)
-            findings.append({"label": label, "action": action, "count": count})
+            # Skip known non-secret patterns
+            if ENTROPY_ALLOWLIST_RE.match(candidate):
+                continue
+
+            if len(candidate) < ENTROPY_MIN_LENGTH:
+                continue
+
+            entropy = shannon_entropy(candidate)
+            if entropy >= ENTROPY_THRESHOLD:
+                findings[candidate] = findings.get(candidate, 0) + 1
 
     return findings
 
@@ -226,10 +360,32 @@ def check_emails(repo_path, allow_config):
         print("WARNING: Non-allowlisted emails found in commit history:")
         for email in personal_emails:
             print(f"  {email}")
-        return [{"label": "Non-allowlisted emails", "action": action,
-                 "count": len(personal_emails)}]
+        return [
+            {
+                "label": "Non-allowlisted emails",
+                "action": action,
+                "count": len(personal_emails),
+            }
+        ]
 
     return []
+
+
+# ── Main ────────────────────────────────────────────────────────────────────────
+
+
+def write_report(content):
+    """Write a timestamped report file to the reports/ directory next to the script."""
+    from datetime import datetime
+
+    report_dir = SCRIPT_DIR / "reports"
+    report_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    report_file = report_dir / f"git-redact-{timestamp}.log"
+
+    report_file.write_text(content, errors="replace")
+    print(f"\nReport written to: {report_file}")
 
 
 def main():
@@ -252,13 +408,42 @@ def main():
 
     all_findings = []
 
+    # Fetch diff once for all pattern and entropy checks
+    diff_lines = get_diff_lines(repo_path)
+
     # ── Paths ──
     path_entries = config.get("paths", [])
     all_findings.extend(check_paths(repo_path, path_entries))
 
-    # ── Patterns ──
+    # ── Patterns (diff-aware: only added lines) ──
     pattern_entries = config.get("patterns", [])
-    all_findings.extend(check_patterns_fast(repo_path, pattern_entries))
+    all_findings.extend(check_patterns(repo_path, pattern_entries, diff_lines))
+
+    # ── Entropy detection ──
+    if not args.no_entropy:
+        print()
+        print("=== High-entropy strings (potential secrets) ===")
+        print(
+            f"  threshold: {ENTROPY_THRESHOLD} bits/char, min length: {ENTROPY_MIN_LENGTH})"
+        )
+        entropy_findings = check_entropy(repo_path, diff_lines)
+        if entropy_findings:
+            for candidate, count in sorted(
+                entropy_findings.items(), key=lambda x: -x[1]
+            ):
+                entropy = shannon_entropy(candidate)
+                print(
+                    f"  [{entropy:.1f} b/pc] {candidate[:80]}{'...' if len(candidate) > 80 else ''} (x{count})"
+                )
+            all_findings.append(
+                {
+                    "label": "High-entropy strings",
+                    "action": "warn",  # always warn, never fail
+                    "count": sum(entropy_findings.values()),
+                }
+            )
+        else:
+            print("  None found")
 
     # ── Emails ──
     allow_config = config.get("allow-emails", {"entries": []})
@@ -268,7 +453,9 @@ def main():
     replace_remove = [f for f in all_findings if f["action"] in ("replace", "remove")]
     if replace_remove and not args.dry_run:
         print()
-        print("NOTE: The following entries have replace/remove actions but history rewriting")
+        print(
+            "NOTE: The following entries have replace/remove actions but history rewriting"
+        )
         print("is not yet implemented. Use --dry-run to preview what would change.")
         for f in replace_remove:
             print(f"  - {f['label']} ({f['action'].upper()})")
@@ -284,10 +471,50 @@ def main():
     print("=" * 42)
     failures = [f for f in all_findings if f["action"] == "report"]
     if not failures:
-        print("PASS: No personal data found in git history")
+        result = "PASS: No personal data found in git history"
+        print(result)
+    else:
+        result = "FAIL: Personal data found in git history (see above)"
+        print(result)
+
+    # ── Write report if requested ──
+    if args.report:
+        from datetime import datetime
+
+        lines = []
+        lines.append("git-redact report")
+        lines.append("=" * 42)
+        lines.append(f"Repository: {repo_path}")
+        lines.append(f"Config: {config_path}")
+        lines.append(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("")
+        lines.append(f"Findings: {len(all_findings)} total")
+        lines.append(
+            f"  FAIL: {len([f for f in all_findings if f['action'] == 'report'])}"
+        )
+        lines.append(
+            f"  WARN: {len([f for f in all_findings if f['action'] == 'warn'])}"
+        )
+        lines.append(
+            f"  REPLACE: {len([f for f in all_findings if f['action'] == 'replace'])}"
+        )
+        lines.append(
+            f"  REMOVE: {len([f for f in all_findings if f['action'] == 'remove'])}"
+        )
+        lines.append("")
+        lines.append(f"Result: {result}")
+        lines.append("")
+        lines.append("=" * 42)
+        lines.append("")
+        lines.append("Findings:")
+        for f in all_findings:
+            lines.append(f"  [{action_label(f['action'])}] {f['label']} ({f['count']})")
+        report_content = "\n".join(lines)
+        write_report(report_content)
+
+    if not failures:
         sys.exit(0)
     else:
-        print("FAIL: Personal data found in git history (see above)")
         sys.exit(1)
 
 

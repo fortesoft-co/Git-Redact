@@ -115,7 +115,7 @@ action = "warn"
 
 [[patterns]]
 label = "Phone numbers (US format)"
-pattern = '([+]?1[-. ]?)?\(?[0-9]{3}\)?[-. ]?[0-9]{3}[-. ]?[0-9]{4}'
+pattern = '(\+1[-. ]?)?\(?[0-9]{3}\)?[-. ]?[0-9]{3}[-. ][0-9]{4}'
 action = "warn"
 
 [[patterns]]
