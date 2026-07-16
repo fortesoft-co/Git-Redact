@@ -1,0 +1,340 @@
+# git-redact configuration
+# ========================================
+#
+# This file defines what the audit script searches for in git history.
+# Copy to git-redact.conf.toml and customise for your repo.
+#
+# Sections:
+#   paths         - File/directory paths to check in git history.
+#                   Uses: git log --all --name-only -- <path>
+#
+#   patterns      - Text/regex patterns to search in full git diff output.
+#                   Uses extended regex (same as grep -E).
+#
+#   allow-emails  - Git author emails considered safe (regex).
+#                   Any commit author email NOT matching one of these
+#                   triggers a warning.
+#
+# Actions (apply to paths and patterns):
+#   report   - Find and report, cause exit 1 if found (default)
+#   warn     - Find and report, but don't cause exit 1
+#   replace  - Find and replace with `replace-with` value (future)
+#   remove   - Delete entirely (future, convenience for paths)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Paths — sensitive files and directories that should not be in history
+# ──────────────────────────────────────────────────────────────────────────────
+
+[[paths]]
+label = "secrets/ directory (should be removed)"
+pattern = "secrets/"
+action = "report"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Patterns — personal data, secrets, and credentials
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Personal identifiers (example — replace with your own) ─────────────────
+
+[[patterns]]
+label = "Username 'johnd'"
+pattern = '"johnd"'
+action = "report"
+
+[[patterns]]
+label = "Name 'John Doe'"
+pattern = "John Doe"
+action = "report"
+
+[[patterns]]
+label = "Surname 'Doe'"
+pattern = "Doe"
+action = "report"
+
+[[patterns]]
+label = "Email johnd@gmail.com"
+pattern = "johnd@gmail.com"
+action = "report"
+
+[[patterns]]
+label = "Email jdoe@acmecorp.com"
+pattern = "jdoe@acmecorp.com"
+action = "report"
+
+[[patterns]]
+label = "Email acmecorp.com domain"
+pattern = "acmecorp.com"
+action = "warn"
+
+[[patterns]]
+label = "Timezone America/New_York"
+pattern = "America/New_York"
+action = "report"
+
+[[patterns]]
+label = "Latitude 40.7"
+pattern = "default = 40.7"
+action = "report"
+
+[[patterns]]
+label = "Longitude -74.0"
+pattern = "default = -74.0"
+action = "report"
+
+[[patterns]]
+label = "Measurement Inches"
+pattern = '"Inches"'
+action = "report"
+
+[[patterns]]
+label = "Temperature Fahrenheit"
+pattern = '"Fahrenheit"'
+action = "report"
+
+[[patterns]]
+label = "macOS user path /Users/johnd"
+pattern = "/Users/johnd"
+action = "report"
+
+[[patterns]]
+label = "Linux user path /home/johnd"
+pattern = "/home/johnd"
+action = "report"
+
+# ── Generic personal data ─────────────────────────────────────────────────
+
+[[patterns]]
+label = "Email addresses"
+pattern = '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+action = "warn"
+
+[[patterns]]
+label = "US Social Security Numbers"
+pattern = '[0-9]{3}-[0-9]{2}-[0-9]{4}'
+action = "warn"
+
+[[patterns]]
+label = "Phone numbers (US format)"
+pattern = '([+]?1[-. ]?)?\(?[0-9]{3}\)?[-. ]?[0-9]{3}[-. ]?[0-9]{4}'
+action = "warn"
+
+[[patterns]]
+label = "Private IPv4 addresses (RFC1918)"
+pattern = '(192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+)'
+action = "warn"
+
+[[patterns]]
+label = "IPv6 unique local addresses"
+pattern = 'fd[0-9a-fA-F]{2}:[0-9a-fA-F]{0,4}:'
+action = "warn"
+
+# ── Private keys and certificates ─────────────────────────────────────────
+
+[[patterns]]
+label = "SSH private key references"
+pattern = "id_rsa"
+action = "report"
+
+[[patterns]]
+label = "Age identity path references"
+pattern = "age.identityPaths"
+action = "report"
+
+[[patterns]]
+label = "Private keys (PEM format)"
+pattern = '-----BEGIN[ A-Z0-9_]*PRIVATE KEY'
+action = "report"
+
+[[patterns]]
+label = "PGP private key blocks"
+pattern = "-----BEGIN PGP PRIVATE KEY BLOCK"
+action = "report"
+
+[[patterns]]
+label = "PKCS12 / PFX certificate files"
+pattern = '\.p12|\.pfx'
+action = "warn"
+
+# ── Hardcoded secrets ────────────────────────────────────────────────────
+
+[[patterns]]
+label = "Password in assignment"
+pattern = '(?i)(password|passwd|pwd)\s*=\s*["\x27][^"\x27]{4,}["\x27]'
+action = "report"
+
+[[patterns]]
+label = "Secret in assignment"
+pattern = '(?i)(secret|secret_key|secret_token|secret_access_key)\s*=\s*["\x27][^"\x27]{4,}["\x27]'
+action = "report"
+
+[[patterns]]
+label = "API key in assignment"
+pattern = '(?i)(api_key|apikey|api_secret|access_key|access_token)\s*=\s*["\x27][^"\x27]{4,}["\x27]'
+action = "report"
+
+[[patterns]]
+label = "Authorization header (Bearer token)"
+pattern = '(?i)Authorization[:][ ]*(Bearer|Token)[ ]+[A-Za-z0-9_\-.]{10,}'
+action = "report"
+
+[[patterns]]
+label = "Basic auth in URLs"
+pattern = 'https?://[^/\s]+:[^/\s]+@[^/\s]+'
+action = "report"
+
+[[patterns]]
+label = "curl --user with credentials"
+pattern = 'curl.*(-u|--user)[ ]+[^ ]+:[^ ]+'
+action = "report"
+
+[[patterns]]
+label = "Database connection strings"
+pattern = '(?i)(postgres|mysql|mongodb|redis)://[^\s"\x27]{10,}'
+action = "report"
+
+# ── Cloud provider keys ──────────────────────────────────────────────────
+
+[[patterns]]
+label = "AWS Access Key IDs"
+pattern = "AKIA[0-9A-Z]{16}"
+action = "report"
+
+[[patterns]]
+label = "AWS Secret Access Keys"
+pattern = '(?i)aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{40}'
+action = "report"
+
+[[patterns]]
+label = "GCP API keys"
+pattern = 'AIza[A-Za-z0-9_\-]{35}'
+action = "report"
+
+[[patterns]]
+label = "Azure client secrets"
+pattern = '[a-zA-Z0-9_~.]{3}Q~[a-zA-Z0-9_~.\-]{31,34}'
+action = "warn"
+
+# ── GitHub / GitLab tokens ───────────────────────────────────────────────
+
+[[patterns]]
+label = "GitHub Personal Access Tokens"
+pattern = "ghp_[0-9a-zA-Z]{36}"
+action = "report"
+
+[[patterns]]
+label = "GitHub Fine-Grained PATs"
+pattern = 'github_pat_[A-Za-z0-9_]{82}'
+action = "report"
+
+[[patterns]]
+label = "GitHub OAuth tokens"
+pattern = "gho_[0-9a-zA-Z]{36}"
+action = "report"
+
+[[patterns]]
+label = "GitHub App tokens"
+pattern = '(ghu|ghs)_[0-9a-zA-Z]{36}'
+action = "report"
+
+[[patterns]]
+label = "GitHub Refresh tokens"
+pattern = "ghr_[0-9a-zA-Z]{36}"
+action = "report"
+
+[[patterns]]
+label = "GitLab Personal Access Tokens"
+pattern = 'glpat-[A-Za-z0-9_\-]{20}'
+action = "report"
+
+[[patterns]]
+label = "GitLab Deploy Tokens"
+pattern = 'gldt-[0-9a-zA-Z_\-]{20}'
+action = "report"
+
+[[patterns]]
+label = "GitLab Runner Registration Tokens"
+pattern = 'GR1348941[A-Za-z0-9_\-]{20}'
+action = "report"
+
+# ── SaaS tokens ──────────────────────────────────────────────────────────
+
+[[patterns]]
+label = "Slack Bot tokens"
+pattern = 'xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9\-]*'
+action = "report"
+
+[[patterns]]
+label = "Slack User tokens"
+pattern = 'xoxp-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9\-]*'
+action = "report"
+
+[[patterns]]
+label = "Slack Webhook URLs"
+pattern = 'hooks\.slack\.com/services/[A-Za-z0-9+/]{43,56}'
+action = "report"
+
+[[patterns]]
+label = "Stripe Secret keys"
+pattern = 'sk_(live|test)_[a-zA-Z0-9]{24,}'
+action = "report"
+
+[[patterns]]
+label = "Stripe Restricted keys"
+pattern = 'rk_(live|test)_[a-zA-Z0-9]{24,}'
+action = "report"
+
+[[patterns]]
+label = "SendGrid API keys"
+pattern = 'SG\.[A-Za-z0-9_\-]{66}'
+action = "report"
+
+[[patterns]]
+label = "Twilio API Keys"
+pattern = "SK[0-9a-fA-F]{32}"
+action = "report"
+
+[[patterns]]
+label = "Mailgun API keys"
+pattern = 'key-[a-f0-9]{32}'
+action = "report"
+
+[[patterns]]
+label = "DigitalOcean PATs"
+pattern = 'dop_v1_[a-f0-9]{64}'
+action = "report"
+
+[[patterns]]
+label = "Heroku API keys"
+pattern = 'HRKU-AA[a0-9a-zA-Z_\-]{58}'
+action = "report"
+
+[[patterns]]
+label = "Shopify Access Tokens"
+pattern = 'shpat_[a-fA-F0-9]{32}'
+action = "report"
+
+[[patterns]]
+label = "Docker Hub PATs"
+pattern = 'dckr_pat_[a-zA-Z0-9_\-]{24}'
+action = "report"
+
+# ── JWTs and encoded secrets ─────────────────────────────────────────────
+
+[[patterns]]
+label = "JSON Web Tokens"
+pattern = 'eyJ[A-Za-z0-9_\-]*\.eyJ[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]*'
+action = "warn"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Allow-emails — safe git author emails (regex patterns)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[allow-emails]
+action = "report"
+# replace-with = "REDACTED@users.noreply.github.com"  # uncomment when action = "replace"
+
+[[allow-emails.entries]]
+email = '123456789\+johndoe@users\.noreply\.github\.com'
+
+[[allow-emails.entries]]
+email = "noreply@github\\.com"
