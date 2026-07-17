@@ -133,9 +133,7 @@ def parse_args():
     )
     parser.add_argument(
         "repo",
-        nargs="?",
-        default=os.getcwd(),
-        help="Path to the git repo (default: current directory)",
+        help="Path to the git repo to audit",
     )
     parser.add_argument("-c", "--config", default=None, help="Path to config file")
     parser.add_argument(
@@ -179,6 +177,10 @@ def parse_args():
         action="store_true",
         help="Write a timestamped report to reports/",
     )
+    # Show help if no arguments provided
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
     return parser.parse_args()
 
 
@@ -1099,17 +1101,13 @@ def main():
         print(f"ERROR: {repo_path} is not a git repository", file=sys.stderr)
         sys.exit(2)
 
-    # Safety check: refuse to rewrite the git-redact repo itself
-    if args.rewrite and repo_path == SCRIPT_DIR:
+    # Safety check: refuse to operate on the git-redact repo itself
+    if repo_path == SCRIPT_DIR:
         print(
-            "ERROR: Refusing to rewrite the git-redact repo itself.",
+            "ERROR: Refusing to audit the git-redact repo itself.",
             file=sys.stderr,
         )
-        print(
-            "If you really want to do this, run from a different directory",
-            file=sys.stderr,
-        )
-        print("and specify the target repo path explicitly.", file=sys.stderr)
+        print("Specify the target repo path explicitly.", file=sys.stderr)
         sys.exit(2)
 
     # Find and load config
