@@ -1,8 +1,32 @@
-# pycaches
-__pycache__/
+# Deny all — only files explicitly allowed below can be committed.
+# This prevents accidental commits of files containing secrets or personal data.
+*
 
-# User config files (contain personal data)
-git-redact.conf.toml
+# ── Allowed files ──────────────────────────────────────────────────────────────
 
-# Generated reports
-reports/
+# The script itself
+!git-redact.py
+
+# Vendored dependency
+!git_filter_repo.py
+
+# Documentation and license
+!README.md
+!THIRD-PARTY
+
+# Example config (no real personal data — John Doe placeholders only)
+!git-redact.conf.example.toml
+
+# The gitignore itself
+!.gitignore
+
+# ── Still denied ───────────────────────────────────────────────────────────────
+
+# User config (contains real personal data)
+# git-redact.conf.toml
+
+# Generated reports (may contain sensitive findings)
+# reports/
+
+# Python cache
+# __pycache__/
