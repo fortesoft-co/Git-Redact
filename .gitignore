@@ -1,6 +1,8 @@
+# pycaches
+__pycache__/
+
 # User config files (contain personal data)
 git-redact.conf.toml
-git-scrub-info.conf.toml
 
 # Generated reports
 reports/

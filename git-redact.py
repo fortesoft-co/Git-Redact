@@ -17,6 +17,7 @@ Exit codes:
 """
 
 import argparse
+import io
 import math
 import os
 import re
@@ -52,7 +53,11 @@ ENTROPY_ALLOWLIST_RE = re.compile(
     r"|^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"  # IP addresses
     r"|^[\w.\-]+@[\w.\-]+\.\w+$"  # email addresses
     r"|^[A-Fa-f0-9]{40}$"  # SHA-1 hashes (commit hashes)
-    r"|^https?://",  # URLs
+    r"|^[A-Fa-f0-9]{64}$"  # SHA-256 hashes
+    r"|^https?://"  # URLs
+    r"|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"  # UUIDs
+    r"|^/nix/store/[a-z0-9]{32}-"  # Nix store paths
+    r"|^[0-9]+\.[0-9]+\.[0-9]+[-+]",  # semver with pre-release/build metadata
     re.IGNORECASE,
 )
 
@@ -80,6 +85,10 @@ def extract_high_entropy_strings(diff_lines):
 
         for match in CANDIDATE_RE.finditer(content):
             candidate = match.group()
+
+            # Skip purely alphabetic strings (long words, camelCase identifiers)
+            if candidate.isalpha():
+                continue
 
             # Skip known non-secret patterns
             if ENTROPY_ALLOWLIST_RE.match(candidate):
@@ -220,6 +229,18 @@ def get_added_lines(diff_lines):
     ]
 
 
+def get_commit_messages(repo_path):
+    """Fetch all commit and tag messages from all refs."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "log", "--all", "--format=%s%n%b"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        errors="replace",
+    )
+    return result.stdout.splitlines()
+
+
 # ── Checks ─────────────────────────────────────────────────────────────────────
 
 
@@ -231,6 +252,31 @@ def action_label(action):
         "replace": "REPLACE",
         "remove": "REMOVE",
     }.get(action, action.upper())
+
+
+def compile_combined_pattern(entries):
+    """Compile multiple pattern entries into a single combined regex.
+
+    Returns a tuple of (combined_regex, group_map) where:
+    - combined_regex has each pattern as a named group (p0, p1, ...)
+    - group_map maps group names to their original entry dicts
+    Patterns with (?i) prefix use inline (?i:...) syntax for per-group
+    case-insensitivity within the combined regex.
+    """
+    parts = []
+    group_map = {}
+    for i, entry in enumerate(entries):
+        name = f"p{i}"
+        pattern = entry["pattern"]
+        if pattern.startswith("(?i)"):
+            inner = pattern[4:]
+            part = f"(?P<{name}>(?i:{inner}))"
+        else:
+            part = f"(?P<{name}>{pattern})"
+        parts.append(part)
+        group_map[name] = entry
+    combined = "|".join(parts)
+    return re.compile(combined), group_map
 
 
 def check_paths(repo_path, entries):
@@ -260,12 +306,61 @@ def check_paths(repo_path, entries):
 
 
 def check_patterns(repo_path, entries, diff_lines=None):
-    """Check for text patterns in git diff output (diff-aware)."""
+    """Check for text patterns in git diff output (diff-aware).
+
+    Uses a single-pass combined regex for performance: all patterns are
+    compiled into one alternation, and each added line is scanned once.
+    """
     if diff_lines is None:
         diff_lines = get_diff_lines(repo_path)
 
     # Only search added lines for pattern matches
     added = get_added_lines(diff_lines)
+
+    if not entries:
+        return []
+
+    combined_regex, group_map = compile_combined_pattern(entries)
+
+    # Single pass over added lines
+    pattern_matches = {f"p{i}": [] for i in range(len(entries))}
+    for line in added:
+        matched_groups = set()
+        for match in combined_regex.finditer(line):
+            group_name = match.lastgroup
+            if (
+                group_name
+                and group_name in group_map
+                and group_name not in matched_groups
+            ):
+                pattern_matches[group_name].append(line)
+                matched_groups.add(group_name)
+
+    # Produce output in the same format as the original per-pattern loop
+    findings = []
+    for i, entry in enumerate(entries):
+        name = f"p{i}"
+        label = entry.get("label", entry["pattern"])
+        action = entry.get("action", "report")
+        matches = pattern_matches[name]
+        count = len(matches)
+        if count > 0:
+            print()
+            print(f"=== {label} ({count} matches) [{action_label(action)}] ===")
+            for m in matches[:20]:
+                print(m)
+            findings.append({"label": label, "action": action, "count": count})
+
+    return findings
+
+
+def check_commit_messages(repo_path, entries, commit_messages=None):
+    """Check for text patterns in commit messages."""
+    if commit_messages is None:
+        commit_messages = get_commit_messages(repo_path)
+
+    if not entries:
+        return []
 
     findings = []
     for entry in entries:
@@ -281,15 +376,23 @@ def check_patterns(repo_path, entries, diff_lines=None):
             search_pattern = search_pattern[4:]
 
         regex = re.compile(search_pattern, flags)
-        matches = [line for line in added if regex.search(line)]
+        matches = [line for line in commit_messages if regex.search(line)]
         count = len(matches)
 
         if count > 0:
             print()
-            print(f"=== {label} ({count} matches) [{action_label(action)}] ===")
+            print(
+                f"=== {label} in commit messages ({count} matches) [{action_label(action)}] ==="
+            )
             for m in matches[:20]:
-                print(m)
-            findings.append({"label": label, "action": action, "count": count})
+                print(f"  {m}")
+            findings.append(
+                {
+                    "label": f"{label} [commit messages]",
+                    "action": action,
+                    "count": count,
+                }
+            )
 
     return findings
 
@@ -303,6 +406,10 @@ def check_entropy(repo_path, diff_lines):
         content = line[1:]  # strip leading +
         for match in CANDIDATE_RE.finditer(content):
             candidate = match.group()
+
+            # Skip purely alphabetic strings (long words, camelCase identifiers)
+            if candidate.isalpha():
+                continue
 
             # Skip known non-secret patterns
             if ENTROPY_ALLOWLIST_RE.match(candidate):
@@ -388,6 +495,29 @@ def write_report(content):
     print(f"\nReport written to: {report_file}")
 
 
+class TeeWriter:
+    """Writes to both a real stream and a capture buffer."""
+
+    def __init__(self, real_stream, capture_buffer):
+        self._real = real_stream
+        self._buf = capture_buffer
+
+    def write(self, text):
+        self._real.write(text)
+        self._buf.write(text)
+
+    def flush(self):
+        self._real.flush()
+        self._buf.flush()
+
+    def fileno(self):
+        return self._real.fileno()
+
+    @property
+    def encoding(self):
+        return self._real.encoding
+
+
 def main():
     args = parse_args()
     repo_path = Path(args.repo).resolve()
@@ -408,8 +538,14 @@ def main():
 
     all_findings = []
 
+    # Capture detailed output for the report
+    log_buffer = io.StringIO()
+    original_stdout = sys.stdout
+    sys.stdout = TeeWriter(original_stdout, log_buffer)
+
     # Fetch diff once for all pattern and entropy checks
     diff_lines = get_diff_lines(repo_path)
+    commit_messages = get_commit_messages(repo_path)
 
     # ── Paths ──
     path_entries = config.get("paths", [])
@@ -418,6 +554,11 @@ def main():
     # ── Patterns (diff-aware: only added lines) ──
     pattern_entries = config.get("patterns", [])
     all_findings.extend(check_patterns(repo_path, pattern_entries, diff_lines))
+
+    # ── Commit messages ──
+    all_findings.extend(
+        check_commit_messages(repo_path, pattern_entries, commit_messages)
+    )
 
     # ── Entropy detection ──
     if not args.no_entropy:
@@ -478,6 +619,9 @@ def main():
         print(result)
 
     # ── Write report if requested ──
+    # Restore stdout before writing report so print() in write_report
+    # goes only to the real terminal, not into the capture buffer.
+    sys.stdout = original_stdout
     if args.report:
         from datetime import datetime
 
@@ -509,6 +653,16 @@ def main():
         lines.append("Findings:")
         for f in all_findings:
             lines.append(f"  [{action_label(f['action'])}] {f['label']} ({f['count']})")
+        # Append the full detailed log captured from stdout
+        detailed_log = log_buffer.getvalue()
+        if detailed_log:
+            lines.append("")
+            lines.append("=" * 42)
+            lines.append("=" * 42)
+            lines.append("")
+            lines.append("Detailed log:")
+            lines.append("")
+            lines.append(detailed_log.rstrip())
         report_content = "\n".join(lines)
         write_report(report_content)
 
