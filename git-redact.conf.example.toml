@@ -34,8 +34,8 @@
 # Actions (apply to paths and patterns):
 #   report   - Find and report, cause exit 1 if found (default)
 #   warn     - Find and report, but don't cause exit 1
-#   replace  - Find and replace with `replace-with` value (future)
-#   remove   - Delete entirely (future, convenience for paths)
+#   replace  - Find and replace with `replace-with` value (use --rewrite)
+#   remove   - Delete text or remove paths entirely (use --rewrite)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Paths — sensitive files and directories that should not be in history

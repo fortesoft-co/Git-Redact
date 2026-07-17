@@ -94,12 +94,30 @@ email = '123456789\+johndoe@users\.noreply\.github\.com'
 |--------|----------|
 | `report` | Find and report, cause exit 1 if found (default) |
 | `warn` | Find and report, but don't cause exit 1 |
-| `replace` | Find and replace with `replace-with` value (future) |
-| `remove` | Delete entirely — paths only (future) |
+| `replace` | Find and replace with `replace-with` value |
+| `remove` | Delete text or remove paths entirely |
 
-> **Note:** `replace` and `remove` actions are reported but not yet executed.
-> History rewriting via `git-filter-repo` will be added in a future release.
-> Use `--dry-run` to preview what would change.
+### History rewriting
+
+`replace` and `remove` actions can rewrite git history using the vendored
+`git-filter-repo`. This is **irreversible** — all commit hashes change.
+
+```sh
+# Preview what would be rewritten (safe, no changes made)
+python3 git-redact.py --rewrite --dry-run /path/to/repo
+
+# Actually rewrite history
+python3 git-redact.py --rewrite /path/to/repo
+```
+
+Pattern `replace` replaces matched text with `replace-with` (default:
+`***REDACTED***`). Pattern `remove` deletes matched text entirely. Path
+`remove` deletes files from history. Path `replace` renames paths using
+`replace-with`. Email `replace` rewrites non-allowlisted emails.
+
+> **Note:** The audit still runs before rewriting. Only entries with `replace`
+> or `remove` actions are rewritten. `report` and `warn` entries are never
+> rewritten.
 
 ### Output format
 

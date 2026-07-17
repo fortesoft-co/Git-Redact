@@ -6,11 +6,13 @@ Usage: python git-redact.py [options] [repo-path]
 Options:
   -c, --config FILE       Path to config file (default: git-redact.conf.toml
                            in the repo root or next to this script)
-  -n, --dry-run           Show what would be replaced/removed without doing it
+  -n, --dry-run           Preview what would be rewritten (with --rewrite)
+  -n, --dry-run           Preview what would be rewritten (with --rewrite)
   --no-builtin            Skip built-in patterns (only use your config)
   --no-binary             Skip binary files in diff output
   --no-entropy            Disable entropy-based secret detection
   --pipeline              Output findings as JSON to stdout (for CI/CD)
+  --rewrite               Rewrite git history to redact matched data
   -r, --report            Write a timestamped report to reports/
   -h, --help              Show this help message
 
@@ -152,6 +154,11 @@ def parse_args():
         "--pipeline",
         action="store_true",
         help="Output findings as JSON to stdout (for CI/CD)",
+    )
+    parser.add_argument(
+        "--rewrite",
+        action="store_true",
+        help="Rewrite git history to redact matched data (requires git-filter-repo)",
     )
     parser.add_argument(
         "-r",
@@ -604,7 +611,175 @@ def check_emails(repo_path, allow_config):
     return []
 
 
-# ── Main ────────────────────────────────────────────────────────────────────────
+# ── History rewriting ────────────────────────────────────────────────────────────
+
+
+def collect_rewrite_rules(config):
+    """Collect all rewrite rules from config entries with replace/remove actions.
+
+    Returns a dict with:
+      blob_replacements: [(compiled_regex, replacement_bytes), ...]
+      message_replacements: [(compiled_regex, replacement_bytes), ...]
+      path_removals: [pattern, ...]
+      path_renames: [(old_pattern, new_pattern), ...]
+      email_replace_with: replacement string or None
+      email_allow_regex: compiled regex or None
+    """
+    blob_replacements = []
+    message_replacements = []
+    path_removals = []
+    path_renames = []
+    email_replace_with = None
+    email_allow_regex = None
+
+    for entry in config.get("patterns", []):
+        action = entry.get("action", "report")
+        if action not in ("replace", "remove"):
+            continue
+        pattern = entry["pattern"]
+        if action == "remove":
+            replace_with = ""
+        else:
+            replace_with = entry.get("replace-with", "***REDACTED***")
+
+        flags = re.IGNORECASE if pattern.startswith("(?i)") else 0
+        search_pattern = pattern[4:] if pattern.startswith("(?i)") else pattern
+        compiled = re.compile(search_pattern.encode(), flags)
+        replacement = replace_with.encode()
+        blob_replacements.append((compiled, replacement))
+        message_replacements.append((compiled, replacement))
+
+    for entry in config.get("paths", []):
+        action = entry.get("action", "report")
+        if action == "remove":
+            path_removals.append(entry["pattern"])
+        elif action == "replace" and "replace-with" in entry:
+            path_renames.append((entry["pattern"], entry["replace-with"]))
+
+    allow_config = config.get("allow-emails", {})
+    if allow_config.get("action") in ("replace", "remove"):
+        email_replace_with = allow_config.get(
+            "replace-with", "REDACTED@users.noreply.github.com"
+        )
+        entries = allow_config.get("entries", [])
+        patterns = [e["email"] if isinstance(e, dict) else e for e in entries]
+        if patterns:
+            email_allow_regex = re.compile(
+                "|".join(f"^({p})$" for p in patterns).encode()
+            )
+
+    return {
+        "blob_replacements": blob_replacements,
+        "message_replacements": message_replacements,
+        "path_removals": path_removals,
+        "path_renames": path_renames,
+        "email_replace_with": email_replace_with,
+        "email_allow_regex": email_allow_regex,
+    }
+
+
+def preview_rewrite(rules, config):
+    """Print a preview of what would be rewritten."""
+    print()
+    print("=== Rewrite preview (dry run) ===")
+    print()
+
+    blob = rules["blob_replacements"]
+    if blob:
+        print("Text replacements in file contents:")
+        for regex, replacement in blob:
+            pattern = regex.pattern.decode("utf-8", errors="replace")
+            repl = replacement.decode("utf-8", errors="replace") or "(empty string)"
+            print(f"  {pattern}  =>  {repl}")
+        print()
+
+    msg = rules["message_replacements"]
+    if msg:
+        print("Text replacements in commit messages:")
+        for regex, replacement in msg:
+            pattern = regex.pattern.decode("utf-8", errors="replace")
+            repl = replacement.decode("utf-8", errors="replace") or "(empty string)"
+            print(f"  {pattern}  =>  {repl}")
+        print()
+
+    path_rm = rules["path_removals"]
+    if path_rm:
+        print("Paths to remove from history:")
+        for p in path_rm:
+            print(f"  {p}")
+        print()
+
+    path_rn = rules["path_renames"]
+    if path_rn:
+        print("Paths to rename in history:")
+        for old, new in path_rn:
+            print(f"  {old}  =>  {new}")
+        print()
+
+    email = rules["email_replace_with"]
+    if email:
+        print(f"Non-allowlisted emails will be replaced with: {email}")
+        print()
+
+    if not any([blob, msg, path_rm, path_rn, email]):
+        print("No rewrite actions found in config.")
+
+
+def do_rewrite(repo_path, rules, dry_run=False):
+    """Rewrite git history using git-filter-repo based on collected rules."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "git_filter_repo", str(SCRIPT_DIR / "git_filter_repo.py")
+    )
+    fr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fr)
+
+    # Build FilteringOptions args
+    args_list = ["--source", str(repo_path), "--force"]
+
+    if dry_run:
+        args_list.append("--dry-run")
+
+    # Path removals: --path <pattern> --invert-paths
+    if rules["path_removals"]:
+        for pattern in rules["path_removals"]:
+            args_list.extend(["--path", pattern])
+        args_list.append("--invert-paths")
+
+    # Path renames
+    for old, new in rules["path_renames"]:
+        args_list.extend(["--path-rename", f"{old}:{new}"])
+
+    args = fr.FilteringOptions.parse_args(args_list)
+
+    # Create callbacks
+    blob_rules = rules["blob_replacements"]
+    msg_rules = rules["message_replacements"]
+    email_replace = rules["email_replace_with"]
+    email_allow = rules["email_allow_regex"]
+
+    def blob_callback(blob, callback_data):
+        for regex, replacement in blob_rules:
+            blob.data = regex.sub(replacement, blob.data)
+
+    def message_callback(message):
+        for regex, replacement in msg_rules:
+            message = regex.sub(replacement, message)
+        return message
+
+    def email_callback(email):
+        if email_allow and not email_allow.match(email):
+            return email_replace.encode()
+        return email
+
+    repo_filter = fr.RepoFilter(
+        args,
+        blob_callback=blob_callback if blob_rules else None,
+        message_callback=message_callback if msg_rules else None,
+        email_callback=email_callback if email_allow else None,
+    )
+    repo_filter.run()
 
 
 def write_report(content):
@@ -725,22 +900,51 @@ def main():
     allow_config = config.get("allow-emails", {"entries": []})
     all_findings.extend(check_emails(repo_path, allow_config))
 
-    # ── Future: replace/remove actions ──
+    # ── History rewriting ──
     replace_remove = [f for f in all_findings if f["action"] in ("replace", "remove")]
-    if replace_remove and not args.dry_run:
-        print()
-        print(
-            "NOTE: The following entries have replace/remove actions but history rewriting"
-        )
-        print("is not yet implemented. Use --dry-run to preview what would change.")
-        for f in replace_remove:
-            print(f"  - {f['label']} ({f['action'].upper()})")
+    rules = collect_rewrite_rules(config)
+    has_rewrite_rules = any(
+        [
+            rules["blob_replacements"],
+            rules["message_replacements"],
+            rules["path_removals"],
+            rules["path_renames"],
+            rules["email_replace_with"],
+        ]
+    )
 
-    if replace_remove and args.dry_run:
+    if args.rewrite and has_rewrite_rules:
+        if args.dry_run:
+            # Preview what would be rewritten
+            preview_rewrite(rules, config)
+        else:
+            # Actually rewrite history
+            print()
+            print("=== Rewriting git history ===")
+            print("WARNING: This will rewrite your git history irreversibly.")
+            print("All commit hashes will change. Force-push to update remotes.")
+            print()
+            try:
+                do_rewrite(repo_path, rules, dry_run=False)
+                print("History rewrite complete.")
+                # Re-audit to show results? Not for now.
+            except Exception as e:
+                print(f"ERROR: History rewrite failed: {e}", file=sys.stderr)
+                sys.exit(2)
+    elif args.dry_run and has_rewrite_rules:
+        # Show preview of what would be rewritten
+        preview_rewrite(rules, config)
+    elif replace_remove and not args.rewrite:
+        # Just report that these actions exist but aren't being executed
         print()
-        print("=== Dry run: would apply the following changes ===")
+        print("NOTE: The following entries have replace/remove actions.")
+        print("Use --rewrite to rewrite history, or --rewrite --dry-run to preview.")
         for f in replace_remove:
             print(f"  - {f['label']} ({f['action'].upper()})")
+    elif has_rewrite_rules and not args.rewrite:
+        print()
+        print("NOTE: Config has replace/remove actions defined.")
+        print("Use --rewrite to rewrite history, or --rewrite --dry-run to preview.")
 
     # ── Summary ──
     print()
