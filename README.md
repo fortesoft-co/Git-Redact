@@ -26,6 +26,12 @@ python3 git-redact.py --no-binary /path/to/repo
 
 # Output JSON for CI/CD pipelines
 python3 git-redact.py --pipeline /path/to/repo
+
+# Preview what rewrite would change (safe, no modifications)
+python3 git-redact.py --preview /path/to/repo
+
+# Rewrite history (with confirmation and 5s countdown)
+python3 git-redact.py --rewrite /path/to/repo
 ```
 
 **No external dependencies** — Python 3.11+ (for built-in TOML support) and git
@@ -104,11 +110,22 @@ email = '123456789\+johndoe@users\.noreply\.github\.com'
 
 ```sh
 # Preview what would be rewritten (safe, no changes made)
-python3 git-redact.py --rewrite --dry-run /path/to/repo
+python3 git-redact.py --preview /path/to/repo
 
-# Actually rewrite history
+# Rewrite history (will prompt for confirmation + 5s countdown)
 python3 git-redact.py --rewrite /path/to/repo
+
+# Skip confirmation (for scripts — use with extreme caution)
+python3 git-redact.py --rewrite -y /path/to/repo
 ```
+
+**Safety guards:**
+- `--rewrite` requires typing `yes` at a confirmation prompt, then waits 5 seconds
+- `-y` skips the prompt (for automated use)
+- `--preview` shows what would change without modifying anything
+- `--pipeline` is mutually exclusive with `--rewrite` and `--preview` (detection only)
+- Always specify the repo path explicitly to avoid accidental rewrites
+- The tool refuses to rewrite its own repository
 
 Pattern `replace` replaces matched text with `replace-with` (default:
 `***REDACTED***`). Pattern `remove` deletes matched text entirely. Path
@@ -180,7 +197,8 @@ python3 git-redact.py --no-binary /path/to/repo
 ### Pipeline mode
 
 For CI/CD integration, use `--pipeline` to output findings as JSON to stdout.
-Human-readable output goes to stderr, so only JSON appears on stdout:
+Human-readable output goes to stderr, so only JSON appears on stdout.
+`--pipeline` is for detection only — it cannot be combined with `--rewrite` or `--preview`.
 
 ```sh
 python3 git-redact.py --pipeline /path/to/repo

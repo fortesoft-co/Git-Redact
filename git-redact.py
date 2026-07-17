@@ -6,15 +6,24 @@ Usage: python git-redact.py [options] [repo-path]
 Options:
   -c, --config FILE       Path to config file (default: git-redact.conf.toml
                            in the repo root or next to this script)
-  -n, --dry-run           Preview what would be rewritten (with --rewrite)
-  -n, --dry-run           Preview what would be rewritten (with --rewrite)
   --no-builtin            Skip built-in patterns (only use your config)
   --no-binary             Skip binary files in diff output
   --no-entropy            Disable entropy-based secret detection
   --pipeline              Output findings as JSON to stdout (for CI/CD)
+  --preview               Preview what rewrite would change (no modifications)
   --rewrite               Rewrite git history to redact matched data
+  -y                      Skip confirmation prompt for --rewrite
   -r, --report            Write a timestamped report to reports/
   -h, --help              Show this help message
+
+Modes:
+  (default)               Audit only — scan and report findings
+  --pipeline              Audit with JSON output — for CI/CD and hooks
+  --preview               Show what rewrite would change — no modifications
+  --rewrite               Rewrite git history (with confirmation and countdown)
+
+  --pipeline is mutually exclusive with --preview and --rewrite.
+  --preview is mutually exclusive with --rewrite.
 
 Exit codes:
   0 - No personal data found
@@ -130,12 +139,6 @@ def parse_args():
     )
     parser.add_argument("-c", "--config", default=None, help="Path to config file")
     parser.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="Show what would be replaced/removed without doing it",
-    )
-    parser.add_argument(
         "--no-entropy",
         action="store_true",
         help="Disable entropy-based secret detection",
@@ -156,9 +159,19 @@ def parse_args():
         help="Output findings as JSON to stdout (for CI/CD)",
     )
     parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Preview what rewrite would change (no modifications)",
+    )
+    parser.add_argument(
         "--rewrite",
         action="store_true",
-        help="Rewrite git history to redact matched data (requires git-filter-repo)",
+        help="Rewrite git history to redact matched data",
+    )
+    parser.add_argument(
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompt for --rewrite (use with caution)",
     )
     parser.add_argument(
         "-r",
@@ -823,9 +836,45 @@ def main():
     args = parse_args()
     repo_path = Path(args.repo).resolve()
 
+    # Validate mutually exclusive flags
+    if args.pipeline and args.rewrite:
+        print(
+            "ERROR: --pipeline and --rewrite are mutually exclusive.", file=sys.stderr
+        )
+        print(
+            "  Use --pipeline for detection (CI/CD), --rewrite for history rewriting.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.pipeline and args.preview:
+        print(
+            "ERROR: --pipeline and --preview are mutually exclusive.", file=sys.stderr
+        )
+        sys.exit(2)
+    if args.preview and args.rewrite:
+        print("ERROR: --preview and --rewrite are mutually exclusive.", file=sys.stderr)
+        print(
+            "  Use --preview to see what would change, --rewrite to actually change it.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # Validate repo
     if not (repo_path / ".git").is_dir():
         print(f"ERROR: {repo_path} is not a git repository", file=sys.stderr)
+        sys.exit(2)
+
+    # Safety check: refuse to rewrite the git-redact repo itself
+    if args.rewrite and repo_path == SCRIPT_DIR:
+        print(
+            "ERROR: Refusing to rewrite the git-redact repo itself.",
+            file=sys.stderr,
+        )
+        print(
+            "If you really want to do this, run from a different directory",
+            file=sys.stderr,
+        )
+        print("and specify the target repo path explicitly.", file=sys.stderr)
         sys.exit(2)
 
     # Find and load config
@@ -914,37 +963,47 @@ def main():
     )
 
     if args.rewrite and has_rewrite_rules:
-        if args.dry_run:
-            # Preview what would be rewritten
-            preview_rewrite(rules, config)
-        else:
-            # Actually rewrite history
-            print()
-            print("=== Rewriting git history ===")
-            print("WARNING: This will rewrite your git history irreversibly.")
-            print("All commit hashes will change. Force-push to update remotes.")
-            print()
-            try:
-                do_rewrite(repo_path, rules, dry_run=False)
-                print("History rewrite complete.")
-                # Re-audit to show results? Not for now.
-            except Exception as e:
-                print(f"ERROR: History rewrite failed: {e}", file=sys.stderr)
-                sys.exit(2)
-    elif args.dry_run and has_rewrite_rules:
+        # Actually rewrite history — require explicit confirmation
+        print()
+        print("=== WARNING: History rewriting ===")
+        print("This will IRREVERSIBLY rewrite git history in:")
+        print(f"  {repo_path}")
+        print("All commit hashes will change. Force-push to update remotes.")
+        print()
+        if not args.y:
+            answer = input("Type 'yes' to confirm: ")
+            if answer.strip().lower() != "yes":
+                print("Aborted. No changes were made.")
+                sys.exit(0)
+
+        # Countdown before proceeding
+        import time
+
+        for i in range(5, 0, -1):
+            print(f"\rRewriting in {i}...  (Ctrl+C to abort)", end="", flush=True)
+            time.sleep(1)
+        print("\rStarting rewrite...                    ")
+
+        try:
+            do_rewrite(repo_path, rules, dry_run=False)
+            print("History rewrite complete.")
+        except Exception as e:
+            print(f"ERROR: History rewrite failed: {e}", file=sys.stderr)
+            sys.exit(2)
+    elif args.preview and has_rewrite_rules:
         # Show preview of what would be rewritten
         preview_rewrite(rules, config)
-    elif replace_remove and not args.rewrite:
+    elif replace_remove and not args.rewrite and not args.preview:
         # Just report that these actions exist but aren't being executed
         print()
         print("NOTE: The following entries have replace/remove actions.")
-        print("Use --rewrite to rewrite history, or --rewrite --dry-run to preview.")
+        print("Use --preview to see what would change, or --rewrite to apply changes.")
         for f in replace_remove:
             print(f"  - {f['label']} ({f['action'].upper()})")
-    elif has_rewrite_rules and not args.rewrite:
+    elif has_rewrite_rules and not args.rewrite and not args.preview:
         print()
         print("NOTE: Config has replace/remove actions defined.")
-        print("Use --rewrite to rewrite history, or --rewrite --dry-run to preview.")
+        print("Use --preview to see what would change, or --rewrite to apply changes.")
 
     # ── Summary ──
     print()
