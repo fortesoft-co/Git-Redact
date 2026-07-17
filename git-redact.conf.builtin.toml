@@ -333,3 +333,15 @@ action = "warn"
 label = "IPv6 unique local addresses"
 pattern = 'fd[0-9a-fA-F]{2}:[0-9a-fA-F]{0,4}:'
 action = "warn"
+
+# ── Git author emails and names ─────────────────────────────────────────────
+# These sections audit git commit author emails and names. By default
+# they have no allow-list entries, so all emails/names are shown but none
+# are flagged. Add entries to your user config to define your allow-list.
+# Use --no-builtin to skip these checks entirely.
+
+[git-author-emails]
+action = "warn"
+
+[git-author-names]
+action = "warn"

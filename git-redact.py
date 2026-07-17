@@ -224,31 +224,39 @@ def load_config(config_path, no_builtin=False):
     git-redact.conf.builtin.toml unless no_builtin is True.
     The user's config is merged on top:
 
-    - paths/patterns with new labels are appended
-    - paths/patterns with a label that matches a builtin override it
-      (with a notification printed to stderr)
-    - allow-emails entries are appended; action/replace-with override
+    - paths/patterns/git-author-email/git-author-name with new labels are appended;
+      same-label entries override builtins (with stderr notification)
+    - git-author-emails/git-author-names: entries are appended; action/replace-with
+      override
+    - After merging, replace-with values from singular git-author-email/name
+      entries (action=replace) are auto-whitelisted in the plural entries
     """
     # Load builtins first (unless --no-builtin)
-    config = {"paths": [], "patterns": [], "allow-emails": {"entries": []}}
+    config = {
+        "paths": [],
+        "patterns": [],
+        "git-author-email": [],
+        "git-author-name": [],
+        "git-author-emails": {"entries": []},
+        "git-author-names": {"entries": []},
+    }
     if not no_builtin and BUILTIN_CONFIG_PATH.is_file():
         with open(BUILTIN_CONFIG_PATH, "rb") as f:
             builtin = tomllib.load(f)
-        for section in ("paths", "patterns"):
+        for section in ("paths", "patterns", "git-author-email", "git-author-name"):
             config[section] = builtin.get(section, [])
-        if "allow-emails" in builtin:
-            config["allow-emails"] = builtin["allow-emails"]
+        for plural in ("git-author-emails", "git-author-names"):
+            if plural in builtin:
+                config[plural] = builtin[plural]
 
     # Merge user config on top (if present)
     if config_path is not None:
         with open(config_path, "rb") as f:
             user = tomllib.load(f)
 
-        for section in ("paths", "patterns"):
+        for section in ("paths", "patterns", "git-author-email", "git-author-name"):
             user_entries = user.get(section, [])
-            # Collect labels from user entries that override builtins
             user_labels = {e.get("label") for e in user_entries if "label" in e}
-            # Remove builtin entries whose labels are overridden
             if user_labels:
                 builtin_labels = {
                     e.get("label") for e in config[section] if "label" in e
@@ -263,20 +271,31 @@ def load_config(config_path, no_builtin=False):
                     config[section] = [
                         e for e in config[section] if e.get("label") not in overridden
                     ]
-            # Append all user entries
             config[section].extend(user_entries)
 
-        if "allow-emails" in user:
-            if "entries" in user["allow-emails"]:
-                config["allow-emails"].setdefault("entries", []).extend(
-                    user["allow-emails"]["entries"]
-                )
-            if "action" in user["allow-emails"]:
-                config["allow-emails"]["action"] = user["allow-emails"]["action"]
-            if "replace-with" in user["allow-emails"]:
-                config["allow-emails"]["replace-with"] = user["allow-emails"][
-                    "replace-with"
-                ]
+        for plural in ("git-author-emails", "git-author-names"):
+            if plural in user:
+                if "entries" in user[plural]:
+                    config[plural].setdefault("entries", []).extend(
+                        user[plural]["entries"]
+                    )
+                if "action" in user[plural]:
+                    config[plural]["action"] = user[plural]["action"]
+                if "replace-with" in user[plural]:
+                    config[plural]["replace-with"] = user[plural]["replace-with"]
+
+    # Auto-whitelist: add replace-with values from singular entries to plural entries
+    for singular, plural, field in [
+        ("git-author-email", "git-author-emails", "email"),
+        ("git-author-name", "git-author-names", "name"),
+    ]:
+        existing = {e[field] for e in config[plural].get("entries", []) if field in e}
+        for entry in config.get(singular, []):
+            if entry.get("action") == "replace" and "replace-with" in entry:
+                escaped = re.escape(entry["replace-with"])
+                if escaped not in existing:
+                    config[plural].setdefault("entries", []).append({field: escaped})
+                    existing.add(escaped)
 
     return config
 
@@ -571,57 +590,154 @@ def check_entropy(repo_path, diff_lines):
     return findings
 
 
-def check_emails(repo_path, allow_config):
-    """Check git author emails against allow-list."""
-    entries = allow_config.get("entries", [])
-    action = allow_config.get("action", "report")
+def check_author_emails(repo_path, singular_entries, plural_config):
+    """Check git author emails against singular patterns and plural allow-list.
+
+    singular_entries: list of [[git-author-email]] entries (like patterns).
+    plural_config: the [git-author-emails] section with entries whitelist
+                   and action/replace-with for non-allowlisted emails.
+    """
+    emails_output = git_cmd(repo_path, "log", "--all", "--format=%ae")
+    emails = sorted(set(emails_output.splitlines()))
+    if not emails:
+        return []
+
+    findings = []
 
     print()
     print("=== Git author emails ===")
-    emails_output = git_cmd(repo_path, "log", "--all", "--format=%ae")
-    emails = sorted(set(emails_output.splitlines()))
     for email in emails:
         print(email)
 
-    print()
-    print("=== Git author names ===")
+    # Singular entries: check each pattern against emails
+    for entry in singular_entries:
+        label = entry.get("label", entry.get("email", "email pattern"))
+        pattern = entry.get("email", entry.get("pattern", ""))
+        action = entry.get("action", "report")
+
+        flags = re.IGNORECASE if pattern.startswith("(?i)") else 0
+        search_pattern = pattern[4:] if pattern.startswith("(?i)") else pattern
+        regex = re.compile(search_pattern, flags)
+
+        matches = [e for e in emails if regex.search(e)]
+        count = len(matches)
+        if count > 0:
+            seen = {}
+            for m in matches:
+                seen[m] = seen.get(m, 0) + 1
+            unique = len(seen)
+            print()
+            print(
+                f"=== {label} ({unique} unique, {count} total) [{action_label(action)}] ==="
+            )
+            for m, c in sorted(seen.items(), key=lambda x: -x[1]):
+                print(f"  [x{c}] {m}")
+            findings.append(
+                {"label": label, "action": action, "count": count, "unique": unique}
+            )
+
+    # Plural section: check emails against allow-list
+    entries = plural_config.get("entries", [])
+    action = plural_config.get("action", "report")
+
+    if entries:
+        allow_patterns = [e["email"] if isinstance(e, dict) else e for e in entries]
+        allow_regex = "|".join(f"^({p})$" for p in allow_patterns)
+
+        personal_emails = []
+        for email in emails:
+            if not re.match(allow_regex, email):
+                personal_emails.append(email)
+
+        if personal_emails:
+            print()
+            print("WARNING: Non-allowlisted emails found in commit history:")
+            for email in personal_emails:
+                print(f"  {email}")
+            findings.append(
+                {
+                    "label": "Non-allowlisted emails",
+                    "action": action,
+                    "count": len(personal_emails),
+                    "unique": len(personal_emails),
+                }
+            )
+
+    return findings
+
+
+def check_author_names(repo_path, singular_entries, plural_config):
+    """Check git author names against singular patterns and plural allow-list.
+
+    Same structure as check_author_emails but for names.
+    """
     names_output = git_cmd(repo_path, "log", "--all", "--format=%an")
     names = sorted(set(names_output.splitlines()))
-    for name in names:
-        print(name)
-    print()
-
-    if not entries:
+    if not names:
         return []
 
-    # Build exclusion regex from allow-list
-    allow_patterns = []
-    for entry in entries:
-        if isinstance(entry, str):
-            allow_patterns.append(entry)
-        else:
-            allow_patterns.append(entry["email"])
+    findings = []
 
-    allow_regex = "|".join(f"^({p})$" for p in allow_patterns)
+    print()
+    print("=== Git author names ===")
+    for name in names:
+        print(name)
 
-    personal_emails = []
-    for email in emails:
-        if not re.match(allow_regex, email):
-            personal_emails.append(email)
+    # Singular entries: check each pattern against names
+    for entry in singular_entries:
+        label = entry.get("label", entry.get("name", "name pattern"))
+        pattern = entry.get("name", entry.get("pattern", ""))
+        action = entry.get("action", "report")
 
-    if personal_emails:
-        print("WARNING: Non-allowlisted emails found in commit history:")
-        for email in personal_emails:
-            print(f"  {email}")
-        return [
-            {
-                "label": "Non-allowlisted emails",
-                "action": action,
-                "count": len(personal_emails),
-            }
-        ]
+        flags = re.IGNORECASE if pattern.startswith("(?i)") else 0
+        search_pattern = pattern[4:] if pattern.startswith("(?i)") else pattern
+        regex = re.compile(search_pattern, flags)
 
-    return []
+        matches = [n for n in names if regex.search(n)]
+        count = len(matches)
+        if count > 0:
+            seen = {}
+            for m in matches:
+                seen[m] = seen.get(m, 0) + 1
+            unique = len(seen)
+            print()
+            print(
+                f"=== {label} ({unique} unique, {count} total) [{action_label(action)}] ==="
+            )
+            for m, c in sorted(seen.items(), key=lambda x: -x[1]):
+                print(f"  [x{c}] {m}")
+            findings.append(
+                {"label": label, "action": action, "count": count, "unique": unique}
+            )
+
+    # Plural section: check names against allow-list
+    entries = plural_config.get("entries", [])
+    action = plural_config.get("action", "report")
+
+    if entries:
+        allow_patterns = [e["name"] if isinstance(e, dict) else e for e in entries]
+        allow_regex = "|".join(f"^({p})$" for p in allow_patterns)
+
+        personal_names = []
+        for name in names:
+            if not re.match(allow_regex, name):
+                personal_names.append(name)
+
+        if personal_names:
+            print()
+            print("WARNING: Non-allowlisted names found in commit history:")
+            for name in personal_names:
+                print(f"  {name}")
+            findings.append(
+                {
+                    "label": "Non-allowlisted names",
+                    "action": action,
+                    "count": len(personal_names),
+                    "unique": len(personal_names),
+                }
+            )
+
+    return findings
 
 
 # ── History rewriting ────────────────────────────────────────────────────────────
@@ -635,15 +751,23 @@ def collect_rewrite_rules(config):
       message_replacements: [(compiled_regex, replacement_bytes), ...]
       path_removals: [pattern, ...]
       path_renames: [(old_pattern, new_pattern), ...]
-      email_replace_with: replacement string or None
+      email_singular_rules: [(compiled_regex, replacement_bytes), ...]
+      email_catchall_replace: string or None
       email_allow_regex: compiled regex or None
+      name_singular_rules: [(compiled_regex, replacement_bytes), ...]
+      name_catchall_replace: string or None
+      name_allow_regex: compiled regex or None
     """
     blob_replacements = []
     message_replacements = []
     path_removals = []
     path_renames = []
-    email_replace_with = None
+    email_singular_rules = []
+    email_catchall_replace = None
     email_allow_regex = None
+    name_singular_rules = []
+    name_catchall_replace = None
+    name_allow_regex = None
 
     for entry in config.get("patterns", []):
         action = entry.get("action", "report")
@@ -669,15 +793,57 @@ def collect_rewrite_rules(config):
         elif action == "replace" and "replace-with" in entry:
             path_renames.append((entry["pattern"], entry["replace-with"]))
 
-    allow_config = config.get("allow-emails", {})
-    if allow_config.get("action") in ("replace", "remove"):
-        email_replace_with = allow_config.get(
+    # Singular git-author-email entries (like patterns, for specific emails)
+    for entry in config.get("git-author-email", []):
+        action = entry.get("action", "report")
+        if action not in ("replace", "remove"):
+            continue
+        pattern = entry.get("email", entry.get("pattern", ""))
+        if action == "remove":
+            replace_with = ""
+        else:
+            replace_with = entry.get("replace-with", "REDACTED")
+        flags = re.IGNORECASE if pattern.startswith("(?i)") else 0
+        search_pattern = pattern[4:] if pattern.startswith("(?i)") else pattern
+        compiled = re.compile(search_pattern.encode(), flags)
+        email_singular_rules.append((compiled, replace_with.encode()))
+
+    # Plural git-author-emails: catch-all for non-allowlisted emails
+    email_plural = config.get("git-author-emails", {})
+    if email_plural.get("action") in ("replace", "remove"):
+        email_catchall_replace = email_plural.get(
             "replace-with", "REDACTED@users.noreply.github.com"
         )
-        entries = allow_config.get("entries", [])
+        entries = email_plural.get("entries", [])
         patterns = [e["email"] if isinstance(e, dict) else e for e in entries]
         if patterns:
             email_allow_regex = re.compile(
+                "|".join(f"^({p})$" for p in patterns).encode()
+            )
+
+    # Singular git-author-name entries
+    for entry in config.get("git-author-name", []):
+        action = entry.get("action", "report")
+        if action not in ("replace", "remove"):
+            continue
+        pattern = entry.get("name", entry.get("pattern", ""))
+        if action == "remove":
+            replace_with = ""
+        else:
+            replace_with = entry.get("replace-with", "REDACTED")
+        flags = re.IGNORECASE if pattern.startswith("(?i)") else 0
+        search_pattern = pattern[4:] if pattern.startswith("(?i)") else pattern
+        compiled = re.compile(search_pattern.encode(), flags)
+        name_singular_rules.append((compiled, replace_with.encode()))
+
+    # Plural git-author-names: catch-all for non-allowlisted names
+    name_plural = config.get("git-author-names", {})
+    if name_plural.get("action") in ("replace", "remove"):
+        name_catchall_replace = name_plural.get("replace-with", "REDACTED")
+        entries = name_plural.get("entries", [])
+        patterns = [e["name"] if isinstance(e, dict) else e for e in entries]
+        if patterns:
+            name_allow_regex = re.compile(
                 "|".join(f"^({p})$" for p in patterns).encode()
             )
 
@@ -686,8 +852,12 @@ def collect_rewrite_rules(config):
         "message_replacements": message_replacements,
         "path_removals": path_removals,
         "path_renames": path_renames,
-        "email_replace_with": email_replace_with,
+        "email_singular_rules": email_singular_rules,
+        "email_catchall_replace": email_catchall_replace,
         "email_allow_regex": email_allow_regex,
+        "name_singular_rules": name_singular_rules,
+        "name_catchall_replace": name_catchall_replace,
+        "name_allow_regex": name_allow_regex,
     }
 
 
@@ -729,12 +899,46 @@ def preview_rewrite(rules, config):
             print(f"  {old}  =>  {new}")
         print()
 
-    email = rules["email_replace_with"]
-    if email:
-        print(f"Non-allowlisted emails will be replaced with: {email}")
+    if rules["email_singular_rules"]:
+        print("Singular email replacements:")
+        for regex, replacement in rules["email_singular_rules"]:
+            pattern = regex.pattern.decode("utf-8", errors="replace")
+            repl = replacement.decode("utf-8", errors="replace") or "(empty string)"
+            print(f"  {pattern}  =>  {repl}")
         print()
 
-    if not any([blob, msg, path_rm, path_rn, email]):
+    if rules["email_catchall_replace"]:
+        print(
+            f"Non-allowlisted emails will be replaced with: {rules['email_catchall_replace']}"
+        )
+        print()
+
+    if rules["name_singular_rules"]:
+        print("Singular name replacements:")
+        for regex, replacement in rules["name_singular_rules"]:
+            pattern = regex.pattern.decode("utf-8", errors="replace")
+            repl = replacement.decode("utf-8", errors="replace") or "(empty string)"
+            print(f"  {pattern}  =>  {repl}")
+        print()
+
+    if rules["name_catchall_replace"]:
+        print(
+            f"Non-allowlisted names will be replaced with: {rules['name_catchall_replace']}"
+        )
+        print()
+
+    if not any(
+        [
+            blob,
+            msg,
+            path_rm,
+            path_rn,
+            rules["email_singular_rules"],
+            rules["email_catchall_replace"],
+            rules["name_singular_rules"],
+            rules["name_catchall_replace"],
+        ]
+    ):
         print("No rewrite actions found in config.")
 
 
@@ -749,7 +953,15 @@ def do_rewrite(repo_path, rules, dry_run=False):
     spec.loader.exec_module(fr)
 
     # Build FilteringOptions args
-    args_list = ["--source", str(repo_path), "--force"]
+    # MUST pass both --source AND --target, otherwise git-filter-repo
+    # defaults --target to cwd, rewriting the wrong repo.
+    args_list = [
+        "--source",
+        str(repo_path),
+        "--target",
+        str(repo_path),
+        "--force",
+    ]
 
     if dry_run:
         args_list.append("--dry-run")
@@ -769,8 +981,12 @@ def do_rewrite(repo_path, rules, dry_run=False):
     # Create callbacks
     blob_rules = rules["blob_replacements"]
     msg_rules = rules["message_replacements"]
-    email_replace = rules["email_replace_with"]
+    email_singular = rules["email_singular_rules"]
+    email_catchall = rules["email_catchall_replace"]
     email_allow = rules["email_allow_regex"]
+    name_singular = rules["name_singular_rules"]
+    name_catchall = rules["name_catchall_replace"]
+    name_allow = rules["name_allow_regex"]
 
     def blob_callback(blob, callback_data):
         for regex, replacement in blob_rules:
@@ -782,15 +998,34 @@ def do_rewrite(repo_path, rules, dry_run=False):
         return message
 
     def email_callback(email):
-        if email_allow and not email_allow.match(email):
-            return email_replace.encode()
+        # Check singular rules first (specific email -> specific replacement)
+        for regex, replacement in email_singular:
+            if regex.search(email):
+                return replacement
+        # Then catch-all: if not allowlisted, use global replacement
+        if email_catchall and email_allow and not email_allow.match(email):
+            return email_catchall.encode()
         return email
+
+    def name_callback(name):
+        # Check singular rules first
+        for regex, replacement in name_singular:
+            if regex.search(name):
+                return replacement
+        # Then catch-all: if not allowlisted, use global replacement
+        if name_catchall and name_allow and not name_allow.match(name):
+            return name_catchall.encode()
+        return name
+
+    has_email_rules = bool(email_singular) or (email_catchall and email_allow)
+    has_name_rules = bool(name_singular) or (name_catchall and name_allow)
 
     repo_filter = fr.RepoFilter(
         args,
         blob_callback=blob_callback if blob_rules else None,
         message_callback=message_callback if msg_rules else None,
-        email_callback=email_callback if email_allow else None,
+        email_callback=email_callback if has_email_rules else None,
+        name_callback=name_callback if has_name_rules else None,
     )
     repo_filter.run()
 
@@ -945,9 +1180,19 @@ def main():
         else:
             print("  None found")
 
-    # ── Emails ──
-    allow_config = config.get("allow-emails", {"entries": []})
-    all_findings.extend(check_emails(repo_path, allow_config))
+    # ── Git author emails ──
+    email_singular = config.get("git-author-email", [])
+    email_plural = config.get("git-author-emails", {"entries": []})
+    if email_singular or email_plural.get("entries") or email_plural.get("action"):
+        all_findings.extend(
+            check_author_emails(repo_path, email_singular, email_plural)
+        )
+
+    # ── Git author names ──
+    name_singular = config.get("git-author-name", [])
+    name_plural = config.get("git-author-names", {"entries": []})
+    if name_singular or name_plural.get("entries") or name_plural.get("action"):
+        all_findings.extend(check_author_names(repo_path, name_singular, name_plural))
 
     # ── History rewriting ──
     replace_remove = [f for f in all_findings if f["action"] in ("replace", "remove")]
@@ -958,7 +1203,10 @@ def main():
             rules["message_replacements"],
             rules["path_removals"],
             rules["path_renames"],
-            rules["email_replace_with"],
+            rules["email_singular_rules"],
+            rules["email_catchall_replace"],
+            rules["name_singular_rules"],
+            rules["name_catchall_replace"],
         ]
     )
 
@@ -1006,14 +1254,16 @@ def main():
         print("Use --preview to see what would change, or --rewrite to apply changes.")
 
     # ── Summary ──
-    print()
-    print("=" * 42)
     failures = [f for f in all_findings if f["action"] == "report"]
     if not failures:
         result = "PASS: No personal data found in git history"
-        print(result)
     else:
         result = "FAIL: Personal data found in git history (see above)"
+
+    # Only show PASS/FAIL summary for audit and rewrite, not preview
+    if not args.preview:
+        print()
+        print("=" * 42)
         print(result)
 
     # ── Write report if requested ──

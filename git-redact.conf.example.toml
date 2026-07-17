@@ -317,15 +317,62 @@ pattern = '\\Users\\johnd'
 action = "report"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Allow-emails — safe git author emails (regex patterns)
+# Git author emails and names
 # ──────────────────────────────────────────────────────────────────────────────
+#
+# These sections audit git commit author emails and names.
+#
+# SINGULAR entries ([[git-author-email]] / [[git-author-name]]) work like
+# patterns — match a specific email/name and apply a specific action.
+# When action = "replace", the replace-with value is automatically added to
+# the plural allow-list so the replacement isn't flagged.
+#
+# PLURAL sections ([git-author-emails] / [git-author-names]) are the
+# catch-all. Entries in the allow-list are safe; everything else gets the
+# section's action/replace-with.
+#
+# Built-in config has these sections with action = "warn" and empty
+# allow-lists. Override them here with your own action and entries.
 
-[allow-emails]
+# ── Singular: targeted email replacement ──────────────────────────────────
+
+[[git-author-email]]
+label = "Personal email johnd@gmail.com"
+email = "johnd@gmail.com"
+action = "replace"
+replace-with = "johnd@users.noreply.github.com"
+
+# ── Singular: targeted name replacement ──────────────────────────────────
+
+[[git-author-name]]
+label = "Personal name 'John Doe'"
+name = "John Doe"
+action = "replace"
+replace-with = "johnd"
+
+# ── Plural: email allow-list (catch-all) ────────────────────────────────
+
+[git-author-emails]
 action = "report"
-# replace-with = "REDACTED@users.noreply.github.com"  # uncomment when action = "replace"
+# replace-with = "REDACTED@users.noreply.github.com"  # uncomment for --rewrite
 
-[[allow-emails.entries]]
-email = '123456789\+johndoe@users\.noreply\.github\.com'
+[[git-author-emails.entries]]
+email = 'johnd@users\.noreply\.github\.com'
 
-[[allow-emails.entries]]
-email = "noreply@github\\.com"
+[[git-author-emails.entries]]
+email = 'noreply@github\.com'
+
+# ── Plural: name allow-list (catch-all) ──────────────────────────────────
+
+[git-author-names]
+action = "report"
+# replace-with = "johnd"  # uncomment for --rewrite
+
+[[git-author-names.entries]]
+name = 'johnd'
+
+[[git-author-names.entries]]
+name = 'GitHub Action'
+
+[[git-author-names.entries]]
+name = 'github-actions\[bot\]'
