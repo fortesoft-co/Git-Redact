@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-git-redact — Audit and scrub git repositories for personal data.
+"""git-redact -- Audit and scrub git repositories for personal data.
 
 Usage: python git-redact.py [options] [repo-path]
 
@@ -9,7 +8,9 @@ Options:
                            in the repo root or next to this script)
   -n, --dry-run           Show what would be replaced/removed without doing it
   --no-builtin            Skip built-in patterns (only use your config)
+  --no-binary             Skip binary files in diff output
   --no-entropy            Disable entropy-based secret detection
+  --pipeline              Output findings as JSON to stdout (for CI/CD)
   -r, --report            Write a timestamped report to reports/
   -h, --help              Show this help message
 
@@ -21,6 +22,7 @@ Exit codes:
 
 import argparse
 import io
+import json
 import math
 import os
 import re
@@ -140,6 +142,16 @@ def parse_args():
         "--no-builtin",
         action="store_true",
         help="Skip built-in patterns (only use your config)",
+    )
+    parser.add_argument(
+        "--no-binary",
+        action="store_true",
+        help="Skip binary files in diff output",
+    )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Output findings as JSON to stdout (for CI/CD)",
     )
     parser.add_argument(
         "-r",
@@ -300,6 +312,46 @@ def get_commit_messages(repo_path):
     return result.stdout.splitlines()
 
 
+def filter_binary_sections(diff_lines):
+    """Remove diff sections for binary files.
+
+    A diff section starts with 'diff --git' and ends at the next
+    'diff --git' line or end of output. Sections containing a line
+    starting with 'Binary files' are removed entirely.
+
+    Lines before the first diff section (commit headers, etc.) are
+    always kept.
+    """
+    result = []
+    current_section = []
+    in_diff_section = False
+
+    for line in diff_lines:
+        if line.startswith("diff --git"):
+            # Finish the previous section
+            if in_diff_section and current_section:
+                if not any(l.startswith("Binary files") for l in current_section):
+                    result.extend(current_section)
+            elif current_section:
+                # Pre-diff lines (commit headers), always keep
+                result.extend(current_section)
+            # Start new section
+            current_section = [line]
+            in_diff_section = True
+        else:
+            current_section.append(line)
+
+    # Handle last section
+    if current_section:
+        if in_diff_section:
+            if not any(l.startswith("Binary files") for l in current_section):
+                result.extend(current_section)
+        else:
+            result.extend(current_section)
+
+    return result
+
+
 # ── Checks ─────────────────────────────────────────────────────────────────────
 
 
@@ -395,7 +447,7 @@ def check_patterns(repo_path, entries, diff_lines=None):
                 pattern_matches[group_name].append(line)
                 matched_groups.add(group_name)
 
-    # Produce output in the same format as the original per-pattern loop
+    # Produce deduplicated output
     findings = []
     for i, entry in enumerate(entries):
         name = f"p{i}"
@@ -404,11 +456,20 @@ def check_patterns(repo_path, entries, diff_lines=None):
         matches = pattern_matches[name]
         count = len(matches)
         if count > 0:
+            # Group identical lines by content, sorted by frequency
+            seen = {}
+            for m in matches:
+                seen[m] = seen.get(m, 0) + 1
+            unique = len(seen)
             print()
-            print(f"=== {label} ({count} matches) [{action_label(action)}] ===")
-            for m in matches[:20]:
-                print(m)
-            findings.append({"label": label, "action": action, "count": count})
+            print(
+                f"=== {label} ({unique} unique, {count} total) [{action_label(action)}] ==="
+            )
+            for m, c in sorted(seen.items(), key=lambda x: -x[1]):
+                print(f"  [x{c}] {m}")
+            findings.append(
+                {"label": label, "action": action, "count": count, "unique": unique}
+            )
 
     return findings
 
@@ -439,17 +500,23 @@ def check_commit_messages(repo_path, entries, commit_messages=None):
         count = len(matches)
 
         if count > 0:
+            # Deduplicate commit messages
+            seen = {}
+            for m in matches:
+                seen[m] = seen.get(m, 0) + 1
+            unique = len(seen)
             print()
             print(
-                f"=== {label} in commit messages ({count} matches) [{action_label(action)}] ==="
+                f"=== {label} in commit messages ({unique} unique, {count} total) [{action_label(action)}] ==="
             )
-            for m in matches[:20]:
-                print(f"  {m}")
+            for m, c in sorted(seen.items(), key=lambda x: -x[1]):
+                print(f"  [x{c}] {m}")
             findings.append(
                 {
                     "label": f"{label} [commit messages]",
                     "action": action,
                     "count": count,
+                    "unique": unique,
                 }
             )
 
@@ -588,11 +655,20 @@ def main():
 
     # Find and load config
     config_path = find_config(args.config, repo_path)
+    config = load_config(config_path, no_builtin=args.no_builtin)
+
+    # Set up output: in pipeline mode, human-readable goes to stderr
+    log_buffer = io.StringIO()
+    original_stdout = sys.stdout
+    if args.pipeline:
+        sys.stdout = TeeWriter(sys.stderr, log_buffer)
+    else:
+        sys.stdout = TeeWriter(original_stdout, log_buffer)
+
     if config_path:
         print(f"Using config: {config_path}")
     else:
         print("No user config found \u2014 using built-in patterns only")
-    config = load_config(config_path, no_builtin=args.no_builtin)
 
     print(f"Auditing git history in: {repo_path}")
     print("Searching all commits across all refs...")
@@ -600,13 +676,10 @@ def main():
 
     all_findings = []
 
-    # Capture detailed output for the report
-    log_buffer = io.StringIO()
-    original_stdout = sys.stdout
-    sys.stdout = TeeWriter(original_stdout, log_buffer)
-
     # Fetch diff once for all pattern and entropy checks
     diff_lines = get_diff_lines(repo_path)
+    if args.no_binary:
+        diff_lines = filter_binary_sections(diff_lines)
     commit_messages = get_commit_messages(repo_path)
 
     # ── Paths ──
@@ -681,9 +754,36 @@ def main():
         print(result)
 
     # ── Write report if requested ──
-    # Restore stdout before writing report so print() in write_report
-    # goes only to the real terminal, not into the capture buffer.
+    # Restore stdout before writing report/pipeline so output goes to
+    # the real terminal, not into the capture buffer.
     sys.stdout = original_stdout
+    if args.pipeline:
+        from datetime import datetime, timezone
+
+        pipeline_data = {
+            "repository": str(repo_path),
+            "config": str(config_path) if config_path else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "result": "PASS" if not failures else "FAIL",
+            "findings": [
+                {
+                    "label": f["label"],
+                    "action": f["action"],
+                    "count": f["count"],
+                    **({"unique": f["unique"]} if "unique" in f else {}),
+                }
+                for f in all_findings
+            ],
+            "stats": {
+                "total": len(all_findings),
+                "report": len([f for f in all_findings if f["action"] == "report"]),
+                "warn": len([f for f in all_findings if f["action"] == "warn"]),
+                "replace": len([f for f in all_findings if f["action"] == "replace"]),
+                "remove": len([f for f in all_findings if f["action"] == "remove"]),
+            },
+        }
+        print(json.dumps(pipeline_data, indent=2))
+
     if args.report:
         from datetime import datetime
 
@@ -714,7 +814,10 @@ def main():
         lines.append("")
         lines.append("Findings:")
         for f in all_findings:
-            lines.append(f"  [{action_label(f['action'])}] {f['label']} ({f['count']})")
+            unique_str = f", {f['unique']} unique" if "unique" in f else ""
+            lines.append(
+                f"  [{action_label(f['action'])}] {f['label']} ({f['count']}{unique_str})"
+            )
         # Append the full detailed log captured from stdout
         detailed_log = log_buffer.getvalue()
         if detailed_log:

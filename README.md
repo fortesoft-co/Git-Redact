@@ -20,6 +20,12 @@ python3 /path/to/git-redact.py
 
 # Skip built-ins if you only want your own patterns
 python3 git-redact.py --no-builtin /path/to/repo
+
+# Skip binary files (avoids noise from images, binaries, etc.)
+python3 git-redact.py --no-binary /path/to/repo
+
+# Output JSON for CI/CD pipelines
+python3 git-redact.py --pipeline /path/to/repo
 ```
 
 **No external dependencies** — Python 3.11+ (for built-in TOML support) and git
@@ -35,6 +41,8 @@ automatically. You only need a config file for personal patterns.
 that are checked by default. They merge with your config and can be
 overridden or skipped entirely:
 
+- **Sensitive file paths** — SSH keys, PEM/PKCS12/JKS files, `.ssh/`, `.aws/`,
+  `.gnupg/`, `.env`, `.netrc`, `.pypirc`, `.htpasswd`, `secrets/`, and more
 - **Private keys and certificates** — PEM, PGP, PKCS12, SSH, Age
 - **Hardcoded secrets** — password/secret/API key assignments, auth headers,
   basic auth in URLs, database connection strings
@@ -93,6 +101,20 @@ email = '123456789\+johndoe@users\.noreply\.github\.com'
 > History rewriting via `git-filter-repo` will be added in a future release.
 > Use `--dry-run` to preview what would change.
 
+### Output format
+
+Pattern matches are deduplicated — identical lines are grouped with a count
+rather than printed repeatedly:
+
+```
+=== Password 'hunter2' (2 unique, 47 total) [FAIL] ===
+  [x25] +password = "hunter2"
+  [x22] +db_password = "hunter2"
+```
+
+The first number is unique matches, the second is total occurrences across
+all commits.
+
 ### Overriding built-in patterns
 
 If a pattern or path in your config has the same `label` as a built-in one,
@@ -130,6 +152,46 @@ To skip built-in patterns entirely and only use your config:
 ```sh
 python3 git-redact.py --no-builtin /path/to/repo
 ```
+
+To skip binary files in diff output (reduces noise from images, archives, etc.):
+
+```sh
+python3 git-redact.py --no-binary /path/to/repo
+```
+
+### Pipeline mode
+
+For CI/CD integration, use `--pipeline` to output findings as JSON to stdout.
+Human-readable output goes to stderr, so only JSON appears on stdout:
+
+```sh
+python3 git-redact.py --pipeline /path/to/repo
+```
+
+Output format:
+
+```json
+{
+  "repository": "/path/to/repo",
+  "config": "/path/to/git-redact.conf.toml",
+  "timestamp": "2024-01-15T12:34:56+00:00",
+  "result": "FAIL",
+  "findings": [
+    {"label": "SSH private key references", "action": "report", "count": 5, "unique": 3},
+    {"label": "Email addresses", "action": "warn", "count": 12}
+  ],
+  "stats": {
+    "total": 2,
+    "report": 1,
+    "warn": 1,
+    "replace": 0,
+    "remove": 0
+  }
+}
+```
+
+The `unique` field is included when available (pattern and commit message findings).
+Exit codes remain the same: 0 = pass, 1 = fail, 2 = error.
 
 ### TOML tips
 

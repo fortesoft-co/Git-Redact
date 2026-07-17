@@ -8,6 +8,108 @@
 # To add your own personal patterns (names, emails, etc.), create a
 # git-redact.conf.toml file. Those patterns are merged on top of these.
 
+# ── Paths — sensitive files and directories ────────────────────────────────
+
+[[paths]]
+label = "Private key files"
+pattern = 'id_rsa'
+action = "report"
+
+[[paths]]
+label = "Private key files (ed25519)"
+pattern = 'id_ed25519'
+action = "report"
+
+[[paths]]
+label = "Private key files (ECDSA)"
+pattern = 'id_ecdsa'
+action = "report"
+
+[[paths]]
+label = "Private key files (DSA)"
+pattern = 'id_dsa'
+action = "report"
+
+[[paths]]
+label = "PEM key files"
+pattern = '.pem'
+action = "warn"
+
+[[paths]]
+label = "PKCS12/PFX certificate files"
+pattern = '.p12'
+action = "warn"
+
+[[paths]]
+label = "PKCS12/PFX certificate files (alternate)"
+pattern = '.pfx'
+action = "warn"
+
+[[paths]]
+label = "Java keystores"
+pattern = '.jks'
+action = "report"
+
+[[paths]]
+label = "SSH directory"
+pattern = '.ssh/'
+action = "report"
+
+[[paths]]
+label = "GNUPG directory"
+pattern = '.gnupg/'
+action = "report"
+
+[[paths]]
+label = "AWS credentials directory"
+pattern = '.aws/'
+action = "report"
+
+[[paths]]
+label = "Kubernetes config directory"
+pattern = '.kube/'
+action = "warn"
+
+[[paths]]
+label = "Docker config"
+pattern = '.docker/'
+action = "warn"
+
+[[paths]]
+label = "Netrc credentials file"
+pattern = '.netrc'
+action = "report"
+
+[[paths]]
+label = "NPM credentials"
+pattern = '.npmrc'
+action = "warn"
+
+[[paths]]
+label = "PyPI credentials"
+pattern = '.pypirc'
+action = "report"
+
+[[paths]]
+label = "HTTP password file"
+pattern = '.htpasswd'
+action = "report"
+
+[[paths]]
+label = "Secrets directory"
+pattern = 'secrets/'
+action = "report"
+
+[[paths]]
+label = "Environment files"
+pattern = '.env'
+action = "report"
+
+[[paths]]
+label = "Age identity files"
+pattern = 'age.identityPaths'
+action = "report"
+
 # ── Private keys and certificates ──────────────────────────────────────────
 
 [[patterns]]
