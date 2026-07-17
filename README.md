@@ -32,7 +32,8 @@ automatically. You only need a config file for personal patterns.
 ## Built-in patterns
 
 `git-redact.conf.builtin.toml` ships with patterns for well-known secrets
-that are always checked, regardless of your config:
+that are checked by default. They merge with your config and can be
+overridden or skipped entirely:
 
 - **Private keys and certificates** — PEM, PGP, PKCS12, SSH, Age
 - **Hardcoded secrets** — password/secret/API key assignments, auth headers,
@@ -43,7 +44,7 @@ that are always checked, regardless of your config:
   Heroku, Shopify, Docker
 - **JWTs** — JSON Web Token detection
 
-These cannot be disabled, but you can override them (see below).
+Use `--no-builtin` to skip them, or override specific entries by label (see below).
 
 ## Configuration
 
