@@ -17,6 +17,9 @@
 # Example config (no real personal data — John Doe placeholders only)
 !git-redact.conf.example.toml
 
+# Built-in patterns (always loaded, shipped with the tool)
+!git-redact.conf.builtin.toml
+
 # The gitignore itself
 !.gitignore
 

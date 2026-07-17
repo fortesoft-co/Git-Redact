@@ -5,10 +5,13 @@ git-redact — Audit and scrub git repositories for personal data.
 Usage: python git-redact.py [options] [repo-path]
 
 Options:
-  -c, --config FILE   Path to config file (default: git-redact.conf.toml
-                      in the repo root or next to this script)
-  -n, --dry-run       Show what would be replaced/removed without doing it
-  -h, --help          Show this help message
+  -c, --config FILE       Path to config file (default: git-redact.conf.toml
+                           in the repo root or next to this script)
+  -n, --dry-run           Show what would be replaced/removed without doing it
+  --no-builtin            Skip built-in patterns (only use your config)
+  --no-entropy            Disable entropy-based secret detection
+  -r, --report            Write a timestamped report to reports/
+  -h, --help              Show this help message
 
 Exit codes:
   0 - No personal data found
@@ -56,7 +59,8 @@ ENTROPY_ALLOWLIST_RE = re.compile(
     r"|^[A-Fa-f0-9]{64}$"  # SHA-256 hashes
     r"|^https?://"  # URLs
     r"|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"  # UUIDs
-    r"|^/nix/store/[a-z0-9]{32}-"  # Nix store paths
+    r"|.*nix/store/[a-z0-9]{32}-"  # Nix store paths (with any prefix)
+    r"|^sha[0-9]+-[A-Za-z0-9+/=]+$"  # SRI hashes (sha256-..., sha512-...)
     r"|^[0-9]+\.[0-9]+\.[0-9]+[-+]",  # semver with pre-release/build metadata
     re.IGNORECASE,
 )
@@ -133,6 +137,11 @@ def parse_args():
         help="Disable entropy-based secret detection",
     )
     parser.add_argument(
+        "--no-builtin",
+        action="store_true",
+        help="Skip built-in patterns (only use your config)",
+    )
+    parser.add_argument(
         "-r",
         "--report",
         action="store_true",
@@ -142,7 +151,11 @@ def parse_args():
 
 
 def find_config(args_config, repo_path):
-    """Resolve config file path."""
+    """Resolve config file path.
+
+    Returns the path to a user config file, or None if no user config
+    exists (builtins will still be loaded by load_config).
+    """
     if args_config:
         config = Path(args_config)
         if not config.is_file():
@@ -165,27 +178,73 @@ def find_config(args_config, repo_path):
         if candidate.is_file():
             return candidate
 
-    print(
-        "ERROR: Config file not found. Set GIT_REDACT_CONFIG, pass --config, or",
-        file=sys.stderr,
-    )
-    print(
-        "       place git-redact.conf.toml in the repo root or next to the script.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    # No user config found — builtins will still be used
+    return None
 
 
-def load_config(config_path):
-    """Load and validate TOML config."""
-    with open(config_path, "rb") as f:
-        config = tomllib.load(f)
+BUILTIN_CONFIG_PATH = SCRIPT_DIR / "git-redact.conf.builtin.toml"
 
-    for section in ("paths", "patterns"):
-        if section not in config:
-            config[section] = []
-    if "allow-emails" not in config:
-        config["allow-emails"] = {"entries": []}
+
+def load_config(config_path, no_builtin=False):
+    """Load builtin patterns, then merge user config on top.
+
+    Built-in patterns (private keys, API tokens, etc.) are loaded from
+    git-redact.conf.builtin.toml unless no_builtin is True.
+    The user's config is merged on top:
+
+    - paths/patterns with new labels are appended
+    - paths/patterns with a label that matches a builtin override it
+      (with a notification printed to stderr)
+    - allow-emails entries are appended; action/replace-with override
+    """
+    # Load builtins first (unless --no-builtin)
+    config = {"paths": [], "patterns": [], "allow-emails": {"entries": []}}
+    if not no_builtin and BUILTIN_CONFIG_PATH.is_file():
+        with open(BUILTIN_CONFIG_PATH, "rb") as f:
+            builtin = tomllib.load(f)
+        for section in ("paths", "patterns"):
+            config[section] = builtin.get(section, [])
+        if "allow-emails" in builtin:
+            config["allow-emails"] = builtin["allow-emails"]
+
+    # Merge user config on top (if present)
+    if config_path is not None:
+        with open(config_path, "rb") as f:
+            user = tomllib.load(f)
+
+        for section in ("paths", "patterns"):
+            user_entries = user.get(section, [])
+            # Collect labels from user entries that override builtins
+            user_labels = {e.get("label") for e in user_entries if "label" in e}
+            # Remove builtin entries whose labels are overridden
+            if user_labels:
+                builtin_labels = {
+                    e.get("label") for e in config[section] if "label" in e
+                }
+                overridden = user_labels & builtin_labels
+                if overridden:
+                    for label in sorted(overridden):
+                        print(
+                            f"  Override: [{section}] '{label}' replaced by user config",
+                            file=sys.stderr,
+                        )
+                    config[section] = [
+                        e for e in config[section] if e.get("label") not in overridden
+                    ]
+            # Append all user entries
+            config[section].extend(user_entries)
+
+        if "allow-emails" in user:
+            if "entries" in user["allow-emails"]:
+                config["allow-emails"].setdefault("entries", []).extend(
+                    user["allow-emails"]["entries"]
+                )
+            if "action" in user["allow-emails"]:
+                config["allow-emails"]["action"] = user["allow-emails"]["action"]
+            if "replace-with" in user["allow-emails"]:
+                config["allow-emails"]["replace-with"] = user["allow-emails"][
+                    "replace-with"
+                ]
 
     return config
 
@@ -529,8 +588,11 @@ def main():
 
     # Find and load config
     config_path = find_config(args.config, repo_path)
-    print(f"Using config: {config_path}")
-    config = load_config(config_path)
+    if config_path:
+        print(f"Using config: {config_path}")
+    else:
+        print("No user config found \u2014 using built-in patterns only")
+    config = load_config(config_path, no_builtin=args.no_builtin)
 
     print(f"Auditing git history in: {repo_path}")
     print("Searching all commits across all refs...")

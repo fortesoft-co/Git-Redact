@@ -17,11 +17,33 @@ python3 git-redact.py /path/to/repo
 # Or run against the current directory
 cd /path/to/repo
 python3 /path/to/git-redact.py
+
+# Skip built-ins if you only want your own patterns
+python3 git-redact.py --no-builtin /path/to/repo
 ```
 
 **No external dependencies** — Python 3.11+ (for built-in TOML support) and git
 are all you need. `git-filter-repo` is vendored for future history-rewriting
 support.
+
+Built-in patterns (private keys, API tokens, credentials) are loaded
+automatically. You only need a config file for personal patterns.
+
+## Built-in patterns
+
+`git-redact.conf.builtin.toml` ships with patterns for well-known secrets
+that are always checked, regardless of your config:
+
+- **Private keys and certificates** — PEM, PGP, PKCS12, SSH, Age
+- **Hardcoded secrets** — password/secret/API key assignments, auth headers,
+  basic auth in URLs, database connection strings
+- **Cloud provider keys** — AWS, GCP, Azure
+- **GitHub/GitLab tokens** — PATs, OAuth, App, Deploy, Runner tokens
+- **SaaS tokens** — Slack, Stripe, SendGrid, Twilio, Mailgun, DigitalOcean,
+  Heroku, Shopify, Docker
+- **JWTs** — JSON Web Token detection
+
+These cannot be disabled, but you can override them (see below).
 
 ## Configuration
 
@@ -39,16 +61,6 @@ action = "remove"
 label = "Email johnd@gmail.com"
 pattern = "johnd@gmail.com"
 action = "report"
-
-[[patterns]]
-label = "AWS Access Key IDs"
-pattern = "AKIA[0-9A-Z]{16}"
-action = "report"
-
-[[patterns]]
-label = "Private IPv4 addresses (may be acceptable)"
-pattern = '(192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+)'
-action = "warn"
 
 # Allow-emails — git author emails considered safe (regex)
 [allow-emails]
@@ -80,6 +92,44 @@ email = '123456789\+johndoe@users\.noreply\.github\.com'
 > History rewriting via `git-filter-repo` will be added in a future release.
 > Use `--dry-run` to preview what would change.
 
+### Overriding built-in patterns
+
+If a pattern or path in your config has the same `label` as a built-in one,
+your entry **replaces** the builtin. This lets you change the action without
+editing the shipped file:
+
+```toml
+# Downgrade the PKCS12 builtin from 'warn' to 'report'
+[[patterns]]
+label = "PKCS12 / PFX certificate files"
+pattern = '\.p12|\.pfx'
+action = "report"
+```
+
+Overrides are printed to stderr so you can see what's being replaced:
+
+```
+  Override: [patterns] 'PKCS12 / PFX certificate files' replaced by user config
+```
+
+### Config file resolution
+
+The script looks for a config file in this order:
+
+1. `--config /path/to/config.toml` CLI flag
+2. `GIT_REDACT_CONFIG` environment variable
+3. `<repo>/git-redact.conf.toml`
+4. `<script-dir>/git-redact.conf.toml`
+
+If no config file is found, built-in patterns still run. You only need a
+config file for personal data (names, emails, timezones, etc.).
+
+To skip built-in patterns entirely and only use your config:
+
+```sh
+python3 git-redact.py --no-builtin /path/to/repo
+```
+
 ### TOML tips
 
 Use single-quoted strings for regex patterns to avoid double-escaping:
@@ -91,15 +141,6 @@ pattern = '(192\.168\.[0-9]+\.[0-9]+)'
 # Double-quoted: backslashes must be escaped
 pattern = "(192\\.168\\.[0-9]+\\.[0-9]+)"
 ```
-
-### Config file resolution
-
-The script looks for a config file in this order:
-
-1. `--config /path/to/config.toml` CLI flag
-2. `GIT_REDACT_CONFIG` environment variable
-3. `<repo>/git-redact.conf.toml`
-4. `<script-dir>/git-redact.conf.toml`
 
 ## Exit codes
 
